@@ -19,6 +19,7 @@ use std::cell::{Cell, RefCell};
 use std::ffi::CString;
 use std::sync::{Arc, Mutex};
 use std::marker::{Send, Sync};
+use std::os::raw::c_void;
 
 use libc::{c_char, intptr_t};
 
@@ -83,7 +84,7 @@ fn take_handle_from_process(handle: HANDLE, source_pid: u32) -> Result<HANDLE,Wi
         let mut newh: HANDLE = INVALID_HANDLE_VALUE;
         let mut other_process: HANDLE = kernel32::OpenProcess(winapi::PROCESS_DUP_HANDLE, winapi::FALSE, source_pid);
         if other_process == INVALID_HANDLE_VALUE {
-            return Err(WinError(GetLastError()));
+            return Err(WinError::last("OpenProcess"));
         }
 
         let ok = kernel32::DuplicateHandle(other_process, handle,
@@ -94,7 +95,7 @@ fn take_handle_from_process(handle: HANDLE, source_pid: u32) -> Result<HANDLE,Wi
         kernel32::CloseHandle(other_process);
 
         if ok == winapi::FALSE {
-            Err(WinError(err))
+            Err(WinError(err/*, "DuplicateHandle"*/))
         } else {
             Ok(newh)
         }
@@ -107,7 +108,7 @@ fn dup_handle_for_process(handle: HANDLE, target_pid: u32) -> Result<HANDLE,WinE
         let mut newh: HANDLE = INVALID_HANDLE_VALUE;
         let mut other_process: HANDLE = kernel32::OpenProcess(winapi::PROCESS_DUP_HANDLE, winapi::FALSE, target_pid);
         if other_process == INVALID_HANDLE_VALUE {
-            return Err(WinError(GetLastError()));
+            return Err(WinError::last("OpenProcess"));
         }
 
         let ok = kernel32::DuplicateHandle(kernel32::GetCurrentProcess(), handle,
@@ -118,7 +119,7 @@ fn dup_handle_for_process(handle: HANDLE, target_pid: u32) -> Result<HANDLE,WinE
         kernel32::CloseHandle(other_process);
 
         if ok == winapi::FALSE {
-            Err(WinError(err))
+            Err(WinError(err/*, "DuplicateHandle"*/))
         } else {
             Ok(newh)
         }
@@ -133,7 +134,7 @@ fn dup_handle(handle: HANDLE) -> Result<HANDLE,WinError> {
                                            kernel32::GetCurrentProcess(), &mut newh,
                                            0, winapi::FALSE, winapi::DUPLICATE_SAME_ACCESS);
         if ok == winapi::FALSE {
-            Err(WinError(GetLastError()))
+            Err(WinError::last("DuplicateHandle"))
         } else {
             Ok(newh)
         }
@@ -446,7 +447,7 @@ impl OsIpcReceiver {
                                            0, // default timeout
                                            ptr::null_mut());
             if hread == INVALID_HANDLE_VALUE {
-                return Err(WinError(GetLastError()));
+                return Err(WinError::last("CreateNamedPipeA"));
             }
 
             let mut internal = OsIpcReceiverInternal::new();
@@ -470,6 +471,8 @@ impl OsIpcReceiver {
         }
     }
 
+    // This function connects the server end of a named pipe, and starts it
+    // listening for a connection using CreateFile
     fn start_connect(&mut self, handle_index: usize) -> HANDLE {
         unsafe {
             let mut internal = self.internal.get_mut().as_mut().unwrap();
@@ -508,6 +511,9 @@ impl OsIpcReceiver {
     
     pub fn recv(&self)
                 -> Result<(Vec<u8>, Vec<OsOpaqueIpcChannel>, Vec<OsIpcSharedMemory>),WinError> {
+        unsafe {
+            let mut internal = self.internal.get_mut().as_mut().unwrap();
+            match internal.complete_read(
         Err(WinError(winapi::ERROR_INVALID_OPERATION))
     }
 
@@ -550,13 +556,13 @@ impl OsIpcSender {
             let handle =
                 kernel32::CreateFileA(pipe_name.as_ptr(),
                                       winapi::GENERIC_WRITE,
-                                      winapi::FILE_SHARE_READ | winapi::FILE_WRITE_ATTRIBUTES,
+                                      0/*winapi::FILE_SHARE_WRITE | winapi::FILE_READ_ATTRIBUTES*/,
                                       ptr::null_mut(), // lpSecurityAttributes
                                       winapi::OPEN_EXISTING,
-                                      winapi::FILE_ATTRIBUTE_NORMAL,
+                                      winapi::FILE_ATTRIBUTE_NORMAL | winapi::FILE_FLAG_OVERLAPPED,
                                       0 as HANDLE);
             if handle == INVALID_HANDLE_VALUE {
-                return Err(WinError(GetLastError()));
+                return Err(WinError::last("CreateFileA"));
             }
 
             // Grab the process so that when we send handles, we know what process to use as
@@ -564,14 +570,14 @@ impl OsIpcSender {
             let mut serverpid: u32 = 0;
             if handle_exchange_pid == INVALID_PID {
                 if kernel32::GetNamedPipeServerProcessId(handle, &mut serverpid) == winapi::FALSE {
-                    let err = GetLastError();
+                    let err = WinError::last("GetNamedPipeServerProcessId");
                     kernel32::CloseHandle(handle);
-                    return Err(WinError(err));
+                    return Err(err);
                 }
             } else {
                 serverpid = handle_exchange_pid;
             }
-            
+
             Ok(OsIpcSender {
                 pipe_id: pipe_uuid.clone(),
                 handle: Cell::new(handle),
@@ -589,7 +595,29 @@ impl OsIpcSender {
                 ports: Vec<OsIpcChannel>,
                 shared_memory_regions: Vec<OsIpcSharedMemory>)
                 -> Result<(),WinError> {
-        Err(WinError(winapi::ERROR_INVALID_OPERATION))
+        let channel_handles: Vec<OsIpcChannelHandle> = vec![];
+        let shmem_sizes: Vec<u64> = vec![];
+        let shmem_handles: Vec<intptr_t> = vec![];
+        
+        let msg = OsIpcMessage {
+            data: data.to_vec(),
+            channel_handles: channel_handles,
+            shmem_sizes: shmem_sizes,
+            shmem_handles: shmem_handles
+        };
+
+        let data = bincode::serde::serialize(&msg, bincode::SizeLimit::Infinite).unwrap();
+        unsafe {
+            let mut wb: u32 = 0;
+            let err = kernel32::WriteFile(self.handle.get(),
+                                          data.as_ptr() as *const c_void,
+                                          data.len() as u32,
+                                          &mut wb, ptr::null_mut());
+            assert!(err == winapi::TRUE);
+            assert!(wb == data.len() as u32);
+        }
+
+        Ok(())
     }
 }
 
@@ -645,9 +673,9 @@ impl OsIpcReceiverSet {
             // do an alertable wait, in case we need to interrupt
             let ok = kernel32::GetQueuedCompletionStatusEx(self.iocp, &mut ov, 1, &mut ovcount,
                                                            winapi::INFINITE, winapi::TRUE);
-            let err = GetLastError();
+            let err = WinError::last("GetQueuedCompletionStatusEx");
             if ok == winapi::FALSE {
-                return Err(WinError(err));
+                return Err(err);
             }
 
             let mut results: Vec<OsIpcSelectionResult> = vec![];
@@ -655,7 +683,7 @@ impl OsIpcReceiverSet {
             // ov.lpCompletionKey contains the handle that succeeded... let's find it
             for rs in &mut self.receivers {
                 if rs.find_handle(ov.lpCompletionKey as HANDLE) != -1 {
-                    match rs.complete_select(&ov, ok == winapi::TRUE, err) {
+                    match rs.complete_select(&ov, true, err.0) {
                         Ok(r) => results.push(r),
                         Err(err) => return Err(err),
                     };
@@ -732,7 +760,7 @@ impl Deref for OsIpcSharedMemory {
 }
 
 unsafe fn allocate_vm_pages(length: usize) -> *mut u8 {
-    let mut address = 0;
+    let address = 0;
     address as *mut u8
 }
 
@@ -797,7 +825,7 @@ impl OsIpcOneShotServer {
                 let event = receiver.start_connect(0);
                 let rv = kernel32::WaitForSingleObject(event, winapi::INFINITE);
                 if rv == winapi::WAIT_FAILED {
-                    return Err(WinError(GetLastError()));
+                    return Err(WinError::last("WaitForSingleObject"));
                 }
                 kernel32::ResetEvent(event);
             }
@@ -865,9 +893,11 @@ impl OsOpaqueIpcChannel {
 pub struct WinError(pub u32);
 
 impl WinError {
-    fn last() -> WinError {
+    fn last(f: &str) -> WinError {
         unsafe {
-            WinError(GetLastError())
+            let err = GetLastError();
+            println!("WinError: {} from {}", err, f);
+            WinError(err)
         }
     }
 
@@ -885,6 +915,7 @@ impl From<WinError> for DeserializeError {
 
 impl From<WinError> for Error {
     fn from(mpsc_error: WinError) -> Error {
-        Error::new(ErrorKind::Other, "Win channel error")
+        //Error::new(ErrorKind::Other, format!("Win channel error ({} from {})", mpsc_error.0, mpsc_error.1))
+        Error::new(ErrorKind::Other, format!("Win channel error ({})", mpsc_error.0))
     }
 }
