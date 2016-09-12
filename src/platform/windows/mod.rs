@@ -37,6 +37,7 @@ use user32;
 const INVALID_PID: u32 = 0xffffffffu32;
 const READ_BUFFER_SIZE: u32 = 8192;
 const NMPWAIT_WAIT_FOREVER: u32 = 0xffffffffu32;
+const NMPWAIT_NOWAIT: u32 = 0x1u32;
 
 pub fn channel() -> Result<(OsIpcSender, OsIpcReceiver),WinError> {
     let mut receiver = try!(OsIpcReceiver::new());
@@ -269,6 +270,7 @@ impl OsIpcReceiver {
     }
 
     unsafe fn do_read(&self) -> Result<OsIpcSelectionResult,WinError> {
+        println!("do_read");
         // optimistically allocate the read buffer
         let mut buf: Vec<u8> = vec![0; READ_BUFFER_SIZE as usize];
         let mut bytes_read: u32 = 0;
@@ -286,8 +288,11 @@ impl OsIpcReceiver {
             // Is the IO operation pending? If so wait for it to complete, since we know one is available
             if ok == winapi::FALSE && err == winapi::ERROR_IO_PENDING {
                 ok = kernel32::GetOverlappedResult(self.handle, read_overlapped.deref_mut(), &mut bytes_read, winapi::TRUE);
+                println!("ReadFile completing via overlapped");
                 err = GetLastError();
             }
+
+            println!("ReadFile read {} bytes -- ok = {}, err = {}", bytes_read, ok, err);
 
             // Now handle real errors
             if ok == winapi::FALSE {
@@ -301,6 +306,7 @@ impl OsIpcReceiver {
                     let mut message_size: u32 = 0;
                     assert!(message_size != buf.len() as u32);
                     let success = kernel32::PeekNamedPipe(self.handle, ptr::null_mut(), 0, ptr::null_mut(), ptr::null_mut(), &mut message_size);
+                    println!("PeekNamedPipe has message size as {}", message_size);
                     assert!(success == winapi::TRUE, "PeekNamedPipe failed");
 
                     buf.resize(message_size as usize, 0);
@@ -312,13 +318,18 @@ impl OsIpcReceiver {
             }
 
             // Hey, the read actually succeeded!
+            // Truncate the buffer to the proper size, so that we can deserialize
+            buf.resize(bytes_read as usize, 0);
             break;
         }
 
         // We now have a complete message in buf! Amazing. \o/
 
         // deserialize!
-        let mut msg: OsIpcMessage = bincode::serde::deserialize(&buf).unwrap();
+        let mut msg: OsIpcMessage = match bincode::serde::deserialize(&buf) {
+            Ok(m) => m,
+            Err(err) => return Err(WinError(0xffffffffu32))
+        };
 
         let mut channels: Vec<OsOpaqueIpcChannel> = vec![];
         let mut shmems: Vec<OsIpcSharedMemory> = vec![];
@@ -343,8 +354,8 @@ impl OsIpcReceiver {
     // connect, read, and close all in one go.
     fn do_read_transaction(&self) -> Result<OsIpcSelectionResult, WinError>
     {
-        assert!(self.connection_ready());
-
+        //assert!(self.connection_ready());
+        println!("do_read_transaction");
         unsafe {
             let result = self.do_read();
             kernel32::ResetEvent(self.conn_overlapped.borrow().hEvent);
@@ -356,6 +367,7 @@ impl OsIpcReceiver {
     // This function connects the server end of a named pipe, and starts it
     // listening for a connection using CreateFile, and returns th
     fn start_connect(&self) {
+        println!("start_connect");
         unsafe {
             let mut conn_overlapped = self.conn_overlapped.borrow_mut();
             let rv = kernel32::ConnectNamedPipe(self.handle,
@@ -365,14 +377,19 @@ impl OsIpcReceiver {
                 // manually signal the evetn
                 conn_overlapped.Internal = 0;
                 kernel32::SetEvent(conn_overlapped.hEvent);
-            } else if rv != 0 || GetLastError() != winapi::ERROR_IO_PENDING {
-                panic!("ConnectNamedPipe errored out!");
+                return;
+            }
+
+            let err = kernel32::GetLastError();
+            if rv != 0 || err != winapi::ERROR_IO_PENDING {
+                panic!("ConnectNamedPipe errored out: {}", WinError::error_string(err));
             }
         }
     }
 
     fn wait_connect(&self) -> Result<(),WinError> {
         unsafe {
+            println!("wait_connect");
             if !self.connection_ready() {
                 let mut conn_overlapped = self.conn_overlapped.borrow_mut();
                 let rv = kernel32::WaitForSingleObject(conn_overlapped.hEvent, winapi::INFINITE);
@@ -404,6 +421,7 @@ impl OsIpcReceiver {
     pub fn recv(&self)
                 -> Result<(Vec<u8>, Vec<OsOpaqueIpcChannel>, Vec<OsIpcSharedMemory>),WinError> {
         unsafe {
+            println!("recv");
             match self.wait_connect() {
                 Err(w) => return Err(w),
                 Ok(_) => {}
@@ -431,14 +449,23 @@ impl OsIpcReceiver {
     }
 }
 
-#[derive(PartialEq, Debug)]
+#[derive(Debug)]
 pub struct OsIpcSender {
     pipe_id: Uuid,
     pipe_name: CString,
+
+    write_ov: RefCell<winapi::OVERLAPPED>,
 }
 
 unsafe impl Send for OsIpcSender { }
 unsafe impl Sync for OsIpcSender { }
+
+impl PartialEq for OsIpcSender {
+    fn eq(&self, other: &OsIpcSender) -> bool {
+        self.pipe_id == other.pipe_id &&
+        self.pipe_name == other.pipe_name
+    }
+}
 
 impl Clone for OsIpcSender {
     fn clone(&self) -> OsIpcSender {
@@ -451,6 +478,7 @@ impl OsIpcSender {
         Ok(OsIpcSender {
             pipe_id: pipe_id,
             pipe_name: make_pipe_name(&pipe_id),
+            write_ov: create_overlapped(),
         })
     }
 
@@ -463,12 +491,12 @@ impl OsIpcSender {
                 ports: Vec<OsIpcChannel>,
                 shared_memory_regions: Vec<OsIpcSharedMemory>)
                 -> Result<(),WinError> {
-        println!("OsIpcSender::send");
         unsafe {
             let channel_handles: Vec<OsIpcChannelHandle> = vec![];
             let shmem_sizes: Vec<u64> = vec![];
             let shmem_handles: Vec<intptr_t> = vec![];
-        
+            let mut ok: i32 = 0;
+
             let msg = OsIpcMessage {
                 data: data.to_vec(),
                 channel_handles: channel_handles,
@@ -478,24 +506,42 @@ impl OsIpcSender {
             };
 
             let data = bincode::serde::serialize(&msg, bincode::SizeLimit::Infinite).unwrap();
-            // 64k is the max size that is guaranteed to be able to be sent in a single transaction
-            assert!(data.len() < (64 * 1024 * 1024));
 
-            println!("CallNamedPipeA {}", data.len());
-            let mut wb: u32 = 0;
-            let ok = kernel32::CallNamedPipeA(self.pipe_name.as_ptr(),
-                                              /* write */
-                                              data.as_ptr() as *mut c_void,
-                                              data.len() as u32,
-                                              /* read */
-                                              ptr::null_mut(), 0,
-                                              ptr::null_mut(),
-                                              /* timeout */
-                                              0 /*NMPWAIT_WAIT_FOREVER*/); /* NMPWAIT_USE_DEFAULT_WAIT? NO_WAIT? */
-            println!("CallNamedPipeA ok");
-            if ok == winapi::FALSE {
-                return Err(WinError::last("CallNamedPipeA"));
+            // 64k is the max size that is guaranteed to be able to be sent in a single transaction
+            // ... but we're not using CallNamedPipe
+            //assert!(data.len() < (64 * 1024));
+
+            let h =
+                kernel32::CreateFileA(self.pipe_name.as_ptr(),
+                                      winapi::GENERIC_WRITE,
+                                      0,
+                                      ptr::null_mut(), // lpSecurityAttributes
+                                      winapi::OPEN_EXISTING,
+                                      winapi::FILE_ATTRIBUTE_NORMAL,
+                                      ptr::null_mut());
+            if h == INVALID_HANDLE_VALUE {
+                return Err(WinError::last("CreateFileA"));
             }
+
+            let mut mode: u32 = winapi::PIPE_READMODE_MESSAGE;
+            ok = kernel32::SetNamedPipeHandleState(h, &mut mode, ptr::null_mut(), ptr::null_mut());
+            if ok == winapi::FALSE {
+                return Err(WinError::last("SetNamedPipeHandleState"));
+            }
+
+            let mut nbytes: u32 = 0;
+            let mut write_ov = self.write_ov.borrow_mut();
+            ok = kernel32::WriteFile(h,
+                                     data.as_ptr() as *mut c_void,
+                                     data.len() as u32,
+                                     &mut nbytes,
+                                     ptr::null_mut());
+            if ok == winapi::FALSE {
+                return Err(WinError::last("WriteFile"));
+            }
+            println!("Wrote {} bytes out of {}", nbytes, data.len());
+
+            kernel32::CloseHandle(h);
         }
 
         Ok(())
@@ -725,10 +771,45 @@ impl OsOpaqueIpcChannel {
 pub struct WinError(pub u32);
 
 impl WinError {
+    pub fn error_string(errnum: u32) -> String {
+        // This value is calculated from the macro
+        // MAKELANGID(LANG_SYSTEM_DEFAULT, SUBLANG_SYS_DEFAULT)
+        let langId = 0x0800 as winapi::DWORD;
+        let mut buf = [0 as winapi::WCHAR; 2048];
+
+        unsafe {
+            let res = kernel32::FormatMessageW(winapi::FORMAT_MESSAGE_FROM_SYSTEM |
+                                               winapi::FORMAT_MESSAGE_IGNORE_INSERTS,
+                                               ptr::null_mut(),
+                                               errnum as winapi::DWORD,
+                                               langId,
+                                               buf.as_mut_ptr(),
+                                               buf.len() as winapi::DWORD,
+                                               ptr::null_mut()) as usize;
+            if res == 0 {
+                // Sometimes FormatMessageW can fail e.g. system doesn't like langId,
+                let fm_err = kernel32::GetLastError();
+                return format!("OS Error {} (FormatMessageW() returned error {})",
+                               errnum, fm_err);
+            }
+
+            match String::from_utf16(&buf[..res]) {
+                Ok(mut msg) => {
+                    // Trim trailing CRLF inserted by FormatMessageW
+                    let len = msg.trim_right().len();
+                    msg.truncate(len);
+                    msg
+                },
+                Err(..) => format!("OS Error {} (FormatMessageW() returned \
+                                    invalid UTF-16)", errnum),
+            }
+        }
+    }
+    
     fn last(f: &str) -> WinError {
         unsafe {
             let err = GetLastError();
-            println!("WinError: {} from {}", err, f);
+            println!("WinError: {} ({}) from {}", WinError::error_string(err), err, f);
             WinError(err)
         }
     }
