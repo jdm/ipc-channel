@@ -16,6 +16,7 @@ use std::ops::Deref;
 use std::ptr;
 use std::slice;
 use std::cell::{Cell, RefCell};
+use std::ops::DerefMut;
 use std::ffi::CString;
 use std::sync::{Arc, Mutex};
 use std::marker::{Send, Sync};
@@ -35,6 +36,7 @@ use user32;
 
 const INVALID_PID: u32 = 0xffffffffu32;
 const READ_BUFFER_SIZE: u32 = 8192;
+const NMPWAIT_WAIT_FOREVER: u32 = 0xffffffffu32;
 
 pub fn channel() -> Result<(OsIpcSender, OsIpcReceiver),WinError> {
     let mut receiver = try!(OsIpcReceiver::new());
@@ -44,19 +46,22 @@ pub fn channel() -> Result<(OsIpcSender, OsIpcReceiver),WinError> {
 
 #[derive(Serialize, Deserialize, Debug)]
 struct OsIpcChannelHandle {
-    // we always send the pipe_id
+    // The pipe_id
     pipe_id: Uuid,
-    // If its a receiver, we also send along all of its existing
-    // receive handles.  If this is None, then it's a sender.
-    receiver: Option<Vec<intptr_t>>
+
+    // If this handle is for a sender or a receiver.
+    // If it's for a receiver, then we'll call CreateNamedPipe to
+    // set up a new server.
+    // If it's for a sender, we'll save the pipe_id so that we
+    // can use it with CallNamedPipe.
+    sender: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 struct OsIpcMessage {
     data: Vec<u8>,
-    // channel handles -- array of handles,
-    // stored as intptr_t so we can ser/de them
     channel_handles: Vec<OsIpcChannelHandle>,
+    shmem_source_pid: u32,
     shmem_sizes: Vec<u64>,
     shmem_handles: Vec<intptr_t>,
 }
@@ -150,146 +155,137 @@ macro_rules! take_handle {
     }}
 }
 
-// On Windows, each pipe is a single sender/receiver pair.  There is
-// no way to receieve from multiple senders on a single receiver
-// handle. So if we send a Sender to a client, we need to create a new
-// anonymous pipe, which results in a new receiver.  This struct
-// represents those handles.
+// On Windows, a named pipe can have multiple servers (created via
+// CreateNamedPipe), and multiple clients (via CreateFile, or other).
+// A client connects to any available server, or blocks.
+// We use CallNamedPipe to perform a connect, a send, a receive (which
+// we don't do), and disconnect all in one go.
+//
+// When we send a named pipe, all we have to send is its name -- if it's
+// a receiver, we can just close it on the source side, and the destination
+// can just create a new server.
 
-struct OsIpcReceiverInternal {
-    // A signalable event handle that will be triggered
-    // whenever the handles vector is mutated.  Any
-    // WaitForMultipleObjects that include this receiver's
-    // handles must wait on this changed_event as well.
-    // The set of connected receiver handles
-    handles: Vec<HANDLE>,
-
-    // If this is not INVALID_HANDLE_VALUE, there is an IOCP
-    // that is waiting on IO on this receiver's handles.
-    // Any modifications of the handles array should also add
-    // the handles to the IOCP.
-    active_iocp: HANDLE,
-    
-    // The process that this channel (receiver/sender) pair was
-    // originally created on.  When we receive a handle on this
-    // receiver, the source process handle is always this,
-    // regardless of which process sent the message.  Receiving
-    // a handle involves duplicating it to the current process
-    // with the source process set to the given pid, and
-    // the DUPLICATE_CLOSE_SOURCE flag.
-    handle_exchange_process_id: u32,
-
-    // The overlapped IO structs, one for each handle
-    overlappeds: Vec<winapi::OVERLAPPED>,
+fn create_overlapped() -> RefCell<winapi::OVERLAPPED> {
+    unsafe {
+        let ev = kernel32::CreateEventA(ptr::null_mut(), winapi::FALSE, winapi::FALSE, ptr::null_mut());
+        assert!(ev != INVALID_HANDLE_VALUE);
+        RefCell::new(winapi::OVERLAPPED {
+            Internal: 0,
+            InternalHigh: 0,
+            Offset: 0,
+            OffsetHigh: 0,
+            hEvent: ev
+        })
+    }
 }
 
-impl Drop for OsIpcReceiverInternal {
+
+#[derive(Debug)]
+pub struct OsIpcReceiver {
+    // the ID of this pipe
+    pipe_id: Uuid,
+
+    // the name of the pipe, constructed from the Uuid
+    pipe_name: CString,
+
+    // The handle to the current server end of a named pipe
+    handle: HANDLE,
+
+    // The overlapped IO struct (with internal event)
+    // used for connections to the pipe
+    conn_overlapped: RefCell<winapi::OVERLAPPED>,
+
+    // overlapped IO struct used for reads
+    read_overlapped: RefCell<winapi::OVERLAPPED>,
+}
+
+
+unsafe impl Send for OsIpcReceiver { }
+unsafe impl Sync for OsIpcReceiver { }
+
+impl PartialEq for OsIpcReceiver {
+    fn eq(&self, other: &OsIpcReceiver) -> bool {
+        self.pipe_id == other.pipe_id &&
+        self.pipe_name == other.pipe_name &&
+        self.handle == other.handle
+    }
+}
+
+impl Drop for OsIpcReceiver {
     fn drop(&mut self) {
         unsafe {
-            for i in 0..(self.handles.len()-1) {
-                kernel32::CancelIoEx(self.handles[i], &mut self.overlappeds[i]);
-                kernel32::CloseHandle(self.handles[i]);
-                kernel32::CloseHandle(self.overlappeds[i].hEvent);
-            }
+            kernel32::CloseHandle(self.handle);
+            kernel32::CloseHandle(self.conn_overlapped.borrow().hEvent);
+            kernel32::CloseHandle(self.read_overlapped.borrow().hEvent);
         }
     }
 }
 
-impl Debug for OsIpcReceiverInternal {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "(OsIpcReceiverInternal)")
-    }
-}
-
-impl PartialEq for OsIpcReceiverInternal {
-    fn eq(&self, other: &OsIpcReceiverInternal) -> bool {
-        self.handles == other.handles &&
-        self.active_iocp == other.active_iocp &&
-        self.handle_exchange_process_id == other.handle_exchange_process_id
-    }
-}
-
-impl OsIpcReceiverInternal {
-    fn new() -> OsIpcReceiverInternal {
+impl OsIpcReceiver {
+    fn from_id(pipe_id: Uuid) -> Result<OsIpcReceiver,WinError> {
         unsafe {
-            OsIpcReceiverInternal {
-                handles: vec![],
-                active_iocp: INVALID_HANDLE_VALUE,
-                overlappeds: vec![],
-                handle_exchange_process_id: kernel32::GetCurrentProcessId(),
+            let pipe_name = make_pipe_name(&pipe_id);
+
+            // create the pipe server
+            let hserver =
+                kernel32::CreateNamedPipeA(pipe_name.as_ptr(),
+                                           winapi::PIPE_ACCESS_DUPLEX | winapi::FILE_FLAG_OVERLAPPED,
+                                           winapi::PIPE_TYPE_MESSAGE | winapi::PIPE_READMODE_MESSAGE,
+                                           winapi::PIPE_UNLIMITED_INSTANCES,
+                                           4096, 4096, // out/in buffer sizes
+                                           0, // default timeout
+                                           ptr::null_mut());
+            if hserver == INVALID_HANDLE_VALUE {
+                return Err(WinError::last("CreateNamedPipeA"));
             }
+
+            let mut rec = OsIpcReceiver {
+                handle: hserver,
+                pipe_id: pipe_id,
+                pipe_name: pipe_name,
+                conn_overlapped: create_overlapped(),
+                read_overlapped: create_overlapped(),
+            };
+
+            // Kick off an overlapped Connect; we'll always have one
+            // waiting
+            rec.start_connect();
+
+            Ok(rec)
         }
     }
 
-    unsafe fn set_iocp(&mut self, iocp: HANDLE) -> Result<(),WinError> {
-        if self.active_iocp == iocp {
-            return Ok(());
-        }
-
-        let my_handles = self.handles.clone();
-        for (index,handle) in my_handles.iter().enumerate() {
-            // cancel any outstanding IO operations associated with this
-            // OVERLAPPED structure
-            kernel32::CancelIoEx(*handle, &mut self.overlappeds[index]);
-
-            // associate the handle with the IOCP
-            kernel32::CreateIoCompletionPort(*handle, iocp, *handle as u64, 0);
-
-            // kick off an async read for later completion
-            self.start_read(*handle);
-        }
-
-        self.active_iocp = iocp;
-        Ok(())
+    fn new() -> Result<OsIpcReceiver,WinError> {
+        let pipe_id = make_pipe_id();
+        OsIpcReceiver::from_id(pipe_id)
     }
 
-    fn find_handle(&self, handle: HANDLE) -> i32 {
-        for (index,h) in self.handles.iter().enumerate() {
-            if *h == handle {
-                return index as i32;
-            }
-        }
-        return -1;
+    fn connection_event(&self) -> HANDLE {
+        self.conn_overlapped.borrow().hEvent
     }
 
-    unsafe fn complete_select(&mut self, ov: &winapi::OVERLAPPED_ENTRY, success: bool, win_err: u32) -> Result<OsIpcSelectionResult,WinError> {
-        let handle = ov.lpCompletionKey as HANDLE;
-        // XXX need to check for -1 result
-        let index = self.find_handle(handle) as usize;
-        
-        // was the connection closed?
-        if !success && win_err == winapi::ERROR_HANDLE_EOF {
-            kernel32::CloseHandle(handle);
-            self.handles.swap_remove(index);
-            self.overlappeds.swap_remove(index);
-            return Ok(OsIpcSelectionResult::ChannelClosed(handle as i64));
-        }
-
-        // we have a read that succeeded
-        let result = self.complete_read(handle, index);
-
-        // kick off another read for later completion
-        self.start_read(handle);
-
-        result
+    fn connection_ready(&self) -> bool {
+        self.conn_overlapped.borrow().Internal != (winapi::STATUS_PENDING as u64)
     }
 
-    unsafe fn complete_read(&mut self, handle: HANDLE, index: usize) -> Result<OsIpcSelectionResult,WinError> {
+    unsafe fn do_read(&self) -> Result<OsIpcSelectionResult,WinError> {
         // optimistically allocate the read buffer
         let mut buf: Vec<u8> = vec![0; READ_BUFFER_SIZE as usize];
         let mut bytes_read: u32 = 0;
 
         loop {
-            let mut ok = kernel32::ReadFile(handle,
+            let mut read_overlapped = self.read_overlapped.borrow_mut();
+            kernel32::ResetEvent(read_overlapped.hEvent);
+            let mut ok = kernel32::ReadFile(self.handle,
                                             buf.as_mut_ptr() as winapi::LPVOID,
                                             buf.len() as u32,
                                             &mut bytes_read,
-                                            &mut self.overlappeds[index]);
+                                            read_overlapped.deref_mut());
             let mut err = GetLastError();
 
             // Is the IO operation pending? If so wait for it to complete, since we know one is available
             if ok == winapi::FALSE && err == winapi::ERROR_IO_PENDING {
-                ok = kernel32::GetOverlappedResult(handle, &mut self.overlappeds[index], &mut bytes_read, winapi::TRUE);
+                ok = kernel32::GetOverlappedResult(self.handle, read_overlapped.deref_mut(), &mut bytes_read, winapi::TRUE);
                 err = GetLastError();
             }
 
@@ -297,13 +293,14 @@ impl OsIpcReceiverInternal {
             if ok == winapi::FALSE {
                 // Was the pipe closed?
                 if err == winapi::ERROR_HANDLE_EOF {
-                    return Ok(OsIpcSelectionResult::ChannelClosed(handle as i64));
+                    return Ok(OsIpcSelectionResult::ChannelClosed(self.handle as i64));
                 }
 
                 // Do we not have enough space to read the full message?
                 if err == winapi::ERROR_MORE_DATA {
                     let mut message_size: u32 = 0;
-                    let success = kernel32::PeekNamedPipe(handle, ptr::null_mut(), 0, ptr::null_mut(), ptr::null_mut(), &mut message_size);
+                    assert!(message_size != buf.len() as u32);
+                    let success = kernel32::PeekNamedPipe(self.handle, ptr::null_mut(), 0, ptr::null_mut(), ptr::null_mut(), &mut message_size);
                     assert!(success == winapi::TRUE, "PeekNamedPipe failed");
 
                     buf.resize(message_size as usize, 0);
@@ -328,214 +325,116 @@ impl OsIpcReceiverInternal {
         
         // play with handles!
         for ch_handle in &mut msg.channel_handles {
-            match ch_handle.receiver {
-                Some(ref handles) => {
-                    let mut our_handles: Vec<HANDLE> = vec![];
-                    for their_handle in handles {
-                        our_handles.push(take_handle_from_process(*their_handle as HANDLE, self.handle_exchange_process_id).unwrap());
-                    }
-                    channels.push(OsOpaqueIpcChannel::from_receiver_handles(ch_handle.pipe_id, &our_handles, self.handle_exchange_process_id));
-                },
-                None => {
-                    channels.push(OsOpaqueIpcChannel::from_sender(ch_handle.pipe_id, self.handle_exchange_process_id));
-                }
-            }
+            channels.push(OsOpaqueIpcChannel::from_opaque(ch_handle));
         }
 
-        for (index,their_handle) in msg.shmem_handles.iter_mut().enumerate() {
-            let our_handle = take_handle_from_process(*their_handle as HANDLE, self.handle_exchange_process_id).unwrap();
-            shmems.push(OsIpcSharedMemory::from_handle(our_handle, msg.shmem_sizes[index] as usize));
+        // XXX fix shmems
+
+        // close!
+        let ok = kernel32::DisconnectNamedPipe(self.handle);
+        if ok == winapi::FALSE {
+            return Err(WinError::last("DisconnectNamedPipe"));
         }
 
-        Ok(OsIpcSelectionResult::DataReceived(handle as i64, msg.data, channels, shmems))
+        Ok(OsIpcSelectionResult::DataReceived(self.handle as i64, msg.data, channels, shmems))
     }
 
-    unsafe fn start_read(&mut self, handle: HANDLE) -> Result<(),WinError> {
-        let index = self.find_handle(handle) as usize;
-        for n in 1..10 {
-            let ok = kernel32::ReadFile(handle,
-                                        ptr::null_mut(), // read buffer -- NULL, we're not actually going to read
-                                        0, // max number of bytes to read -- 0
-                                        ptr::null_mut(), // out value of number of bytes actually read -- NULL with overlapped IO
-                                        &mut self.overlappeds[index]);
+    // This is called when we know we have a connection ready; we're going to
+    // connect, read, and close all in one go.
+    fn do_read_transaction(&self) -> Result<OsIpcSelectionResult, WinError>
+    {
+        assert!(self.connection_ready());
 
-            // grab the actual error code
-            let err = GetLastError();
-
-            // we expect ReadFile to return FALSE -- ideally to get ERROR_IO_PENDING, but also perhaps
-            // ERROR_MORE_DATA if our async read turned into a sync one.  That should never happen
-            // with a named pipe, but it's a possibility.
-            if ok == winapi::FALSE {
-                // the expected result -- async read was queued
-                if err == winapi::ERROR_IO_PENDING {
-                    return Ok(());
-                }
-
-                // If it's ERROR_MORE_DATA or EOF, then we have an actual read that needs to take place.
-                // We don't handle it, instead we tell our IOCP to handle it.
-                if err == winapi::ERROR_MORE_DATA || err == winapi::ERROR_HANDLE_EOF {
-                    kernel32::PostQueuedCompletionStatus(self.active_iocp,
-                                                         0, handle as u64, &mut self.overlappeds[index]);
-                    return Ok(());
-                }
-
-                return Err(WinError(err));
-            }
-
-            // ReadFile succeeded with a read of 0.  The other end must have called Write with num bytes
-            // 0.  What?  Keep looping.
-        }
-
-        panic!("start_read -- went through 10 loops of ReadFile() returning TRUE, what's going on?");
-    }
-
-    fn add_handle(&mut self, handle: HANDLE) -> () {
-        // Create a completion event & OVERLAPPED structure to use for this
         unsafe {
-            let completion_event = kernel32::CreateEventA(ptr::null_mut(), winapi::FALSE, winapi::FALSE, ptr::null_mut());
-            assert!(completion_event != INVALID_HANDLE_VALUE);
-
-            let mut overlapped = winapi::OVERLAPPED {
-                Internal: 0,
-                InternalHigh: 0,
-                Offset: 0,
-                OffsetHigh: 0,
-                hEvent: completion_event
-            };
-
-            // add the handle and the overlapped struct to vectors
-            self.handles.push(handle);
-            self.overlappeds.push(overlapped);
-
-            if self.active_iocp != INVALID_HANDLE_VALUE {
-                // add it to the active iocp
-                kernel32::CreateIoCompletionPort(handle, self.active_iocp, handle as u64, 0);
-                // kick off a read
-                self.start_read(handle);
-            }
-        }
-    }
-}
-
-#[derive(PartialEq, Debug)]
-pub struct OsIpcReceiver {
-    internal: RefCell<Option<OsIpcReceiverInternal>>,
-    pipe_id: Uuid,
-}
-
-unsafe impl Send for OsIpcReceiver { }
-unsafe impl Sync for OsIpcReceiver { }
-
-impl Drop for OsIpcReceiver {
-    fn drop(&mut self) {
-    }
-}
-
-impl OsIpcReceiver {
-    fn new() -> Result<OsIpcReceiver,WinError> {
-        unsafe {
-            let pipe_id = make_pipe_id();
-            let pipe_name = make_pipe_name(&pipe_id);
-
-            // first create the pipe and get the read portion
-            let hread =
-                kernel32::CreateNamedPipeA(pipe_name.as_ptr(),
-                                           winapi::PIPE_ACCESS_INBOUND | winapi::FILE_FLAG_OVERLAPPED,
-                                           winapi::PIPE_TYPE_MESSAGE | winapi::PIPE_READMODE_MESSAGE,
-                                           winapi::PIPE_UNLIMITED_INSTANCES,
-                                           4096, 4096, // out/in buffer sizes
-                                           0, // default timeout
-                                           ptr::null_mut());
-            if hread == INVALID_HANDLE_VALUE {
-                return Err(WinError::last("CreateNamedPipeA"));
-            }
-
-            let mut internal = OsIpcReceiverInternal::new();
-            internal.add_handle(hread);
-
-            Ok(OsIpcReceiver {
-                internal: RefCell::new(Some(internal)),
-                pipe_id: pipe_id
-            })
-        }
-    }
-
-    fn from_handles(pipe_id: Uuid, handles: &Vec<HANDLE>, handle_exchange_pid: u32) -> OsIpcReceiver {
-        let mut internal = OsIpcReceiverInternal::new();
-        for handle in handles.iter() {
-            internal.add_handle(*handle as HANDLE);
-        }
-        OsIpcReceiver {
-            internal: RefCell::new(Some(internal)),
-            pipe_id: pipe_id.clone()
+            let result = self.do_read();
+            kernel32::ResetEvent(self.conn_overlapped.borrow().hEvent);
+            self.start_connect();
+            result
         }
     }
 
     // This function connects the server end of a named pipe, and starts it
-    // listening for a connection using CreateFile
-    fn start_connect(&mut self, handle_index: usize) -> HANDLE {
+    // listening for a connection using CreateFile, and returns th
+    fn start_connect(&self) {
         unsafe {
-            let mut internal = self.internal.get_mut().as_mut().unwrap();
-            assert!(handle_index < internal.handles.len());
+            let mut conn_overlapped = self.conn_overlapped.borrow_mut();
+            let rv = kernel32::ConnectNamedPipe(self.handle,
+                                                conn_overlapped.deref_mut());
+            if rv == winapi::ERROR_PIPE_CONNECTED as i32 {
+                // a client connected before the call; this is finished.
+                // manually signal the evetn
+                conn_overlapped.Internal = 0;
+                kernel32::SetEvent(conn_overlapped.hEvent);
+            } else if rv != 0 || GetLastError() != winapi::ERROR_IO_PENDING {
+                panic!("ConnectNamedPipe errored out!");
+            }
+        }
+    }
 
-            let rv = kernel32::ConnectNamedPipe(internal.handles[handle_index],
-                                                &mut internal.overlappeds[handle_index]);
-            assert!(rv == 0);
-            assert!(GetLastError() == winapi::ERROR_IO_PENDING);
-
-            internal.overlappeds[handle_index].hEvent
+    fn wait_connect(&self) -> Result<(),WinError> {
+        unsafe {
+            if !self.connection_ready() {
+                let mut conn_overlapped = self.conn_overlapped.borrow_mut();
+                let rv = kernel32::WaitForSingleObject(conn_overlapped.hEvent, winapi::INFINITE);
+                if rv != 0 {
+                    return Err(WinError::last("WaitForSingleObject"));
+                }
+            }
+            Ok(())
         }
     }
 
     fn sender(&mut self) -> Result<OsIpcSender,WinError> {
-        // kick off the connect
-        self.start_connect(0);
-
-        // then just use OsIpcSender::connect to create the sender
-        OsIpcSender::connect(self.pipe_id.to_string())
+        OsIpcSender::connect_pipe_id(self.pipe_id)
     }
 
     pub fn consume(&self) -> OsIpcReceiver {
-        let inner = mem::replace(&mut *self.internal.borrow_mut(), None);
-
+        // we should probably close self.handle etc.
+        // and create an entirely new pipe; just
+        // OsIpcReceiver::from_id(self.pipe_id)
         OsIpcReceiver {
-            internal: RefCell::new(inner),
-            pipe_id: Uuid::nil(),
+            handle: self.handle,
+            pipe_id: self.pipe_id,
+            pipe_name: self.pipe_name.clone(),
+            conn_overlapped: create_overlapped(), //self.conn_overlapped,
+            read_overlapped: create_overlapped(), //self.read_overlapped,
         }
     }
 
-    fn take_internal(&self) -> OsIpcReceiverInternal {
-        let inner = mem::replace(&mut *self.internal.borrow_mut(), None);
-        inner.unwrap()
-    }
-    
     pub fn recv(&self)
                 -> Result<(Vec<u8>, Vec<OsOpaqueIpcChannel>, Vec<OsIpcSharedMemory>),WinError> {
         unsafe {
-            let mut internal = self.internal.get_mut().as_mut().unwrap();
-            match internal.complete_read(
-        Err(WinError(winapi::ERROR_INVALID_OPERATION))
+            match self.wait_connect() {
+                Err(w) => return Err(w),
+                Ok(_) => {}
+            }
+
+            match self.do_read_transaction() {
+                Ok(r) => match r {
+                    OsIpcSelectionResult::DataReceived(_, a, b, c) => Ok((a, b, c)),
+                    OsIpcSelectionResult::ChannelClosed(_) => Err(WinError::last("Channel closed?")),
+                },
+                Err(err) => Err(err)
+            }
+        }
     }
 
     pub fn try_recv(&self)
                     -> Result<(Vec<u8>, Vec<OsOpaqueIpcChannel>, Vec<OsIpcSharedMemory>),WinError> {
-        Err(WinError(winapi::ERROR_INVALID_OPERATION))
+        if !self.connection_ready() {
+            // there's nothing connecting, so nothing to receive
+            Ok((vec![], vec![], vec![]))
+        } else {
+            // we know there's something waiting, so just do a normal recv()
+            self.recv()
+        }
     }
 }
 
 #[derive(PartialEq, Debug)]
 pub struct OsIpcSender {
     pipe_id: Uuid,
-    handle: Cell<HANDLE>,
-    // The process that this channel (receiver/sender) pair was
-    // originally created on.  When we send a handle using this
-    // sender, we first need to duplicate the handle with the
-    // destination being the process with this pid, and then
-    // we send it.  The receiver will DuplicateHandle to itself
-    // with its own process as the receiver, this same PID
-    // as the sender, and will use DUPLICATE_CLOSE_SOURCE to
-    // close the handle in the source.
-    handle_exchange_process_id: u32,
+    pipe_name: CString,
 }
 
 unsafe impl Send for OsIpcSender { }
@@ -543,51 +442,20 @@ unsafe impl Sync for OsIpcSender { }
 
 impl Clone for OsIpcSender {
     fn clone(&self) -> OsIpcSender {
-        OsIpcSender::connect_inner(self.pipe_id.to_string(), self.handle_exchange_process_id).unwrap()
+        OsIpcSender::connect_pipe_id(self.pipe_id).unwrap()
     }
 }
 
 impl OsIpcSender {
-    // XXX should we lazy-connect on send?
-    fn connect_inner(name: String, handle_exchange_pid: u32) -> Result<OsIpcSender,WinError> {
-        unsafe {
-            let pipe_uuid = Uuid::parse_str(&name).unwrap();
-            let pipe_name = make_pipe_name(&pipe_uuid);
-            let handle =
-                kernel32::CreateFileA(pipe_name.as_ptr(),
-                                      winapi::GENERIC_WRITE,
-                                      0/*winapi::FILE_SHARE_WRITE | winapi::FILE_READ_ATTRIBUTES*/,
-                                      ptr::null_mut(), // lpSecurityAttributes
-                                      winapi::OPEN_EXISTING,
-                                      winapi::FILE_ATTRIBUTE_NORMAL | winapi::FILE_FLAG_OVERLAPPED,
-                                      0 as HANDLE);
-            if handle == INVALID_HANDLE_VALUE {
-                return Err(WinError::last("CreateFileA"));
-            }
-
-            // Grab the process so that when we send handles, we know what process to use as
-            // the handle exchange process.
-            let mut serverpid: u32 = 0;
-            if handle_exchange_pid == INVALID_PID {
-                if kernel32::GetNamedPipeServerProcessId(handle, &mut serverpid) == winapi::FALSE {
-                    let err = WinError::last("GetNamedPipeServerProcessId");
-                    kernel32::CloseHandle(handle);
-                    return Err(err);
-                }
-            } else {
-                serverpid = handle_exchange_pid;
-            }
-
-            Ok(OsIpcSender {
-                pipe_id: pipe_uuid.clone(),
-                handle: Cell::new(handle),
-                handle_exchange_process_id: serverpid,
-            })
-        }
+    fn connect_pipe_id(pipe_id: Uuid) -> Result<OsIpcSender,WinError> {
+        Ok(OsIpcSender {
+            pipe_id: pipe_id,
+            pipe_name: make_pipe_name(&pipe_id),
+        })
     }
 
     pub fn connect(name: String) -> Result<OsIpcSender,WinError> {
-        OsIpcSender::connect_inner(name, INVALID_PID)
+        OsIpcSender::connect_pipe_id(Uuid::parse_str(&name).unwrap())
     }
 
     pub fn send(&self,
@@ -595,26 +463,39 @@ impl OsIpcSender {
                 ports: Vec<OsIpcChannel>,
                 shared_memory_regions: Vec<OsIpcSharedMemory>)
                 -> Result<(),WinError> {
-        let channel_handles: Vec<OsIpcChannelHandle> = vec![];
-        let shmem_sizes: Vec<u64> = vec![];
-        let shmem_handles: Vec<intptr_t> = vec![];
-        
-        let msg = OsIpcMessage {
-            data: data.to_vec(),
-            channel_handles: channel_handles,
-            shmem_sizes: shmem_sizes,
-            shmem_handles: shmem_handles
-        };
-
-        let data = bincode::serde::serialize(&msg, bincode::SizeLimit::Infinite).unwrap();
+        println!("OsIpcSender::send");
         unsafe {
+            let channel_handles: Vec<OsIpcChannelHandle> = vec![];
+            let shmem_sizes: Vec<u64> = vec![];
+            let shmem_handles: Vec<intptr_t> = vec![];
+        
+            let msg = OsIpcMessage {
+                data: data.to_vec(),
+                channel_handles: channel_handles,
+                shmem_source_pid: kernel32::GetCurrentProcessId(),
+                shmem_sizes: shmem_sizes,
+                shmem_handles: shmem_handles
+            };
+
+            let data = bincode::serde::serialize(&msg, bincode::SizeLimit::Infinite).unwrap();
+            // 64k is the max size that is guaranteed to be able to be sent in a single transaction
+            assert!(data.len() < (64 * 1024 * 1024));
+
+            println!("CallNamedPipeA {}", data.len());
             let mut wb: u32 = 0;
-            let err = kernel32::WriteFile(self.handle.get(),
-                                          data.as_ptr() as *const c_void,
-                                          data.len() as u32,
-                                          &mut wb, ptr::null_mut());
-            assert!(err == winapi::TRUE);
-            assert!(wb == data.len() as u32);
+            let ok = kernel32::CallNamedPipeA(self.pipe_name.as_ptr(),
+                                              /* write */
+                                              data.as_ptr() as *mut c_void,
+                                              data.len() as u32,
+                                              /* read */
+                                              ptr::null_mut(), 0,
+                                              ptr::null_mut(),
+                                              /* timeout */
+                                              0 /*NMPWAIT_WAIT_FOREVER*/); /* NMPWAIT_USE_DEFAULT_WAIT? NO_WAIT? */
+            println!("CallNamedPipeA ok");
+            if ok == winapi::FALSE {
+                return Err(WinError::last("CallNamedPipeA"));
+            }
         }
 
         Ok(())
@@ -622,11 +503,10 @@ impl OsIpcSender {
 }
 
 pub struct OsIpcReceiverSet {
-    // an IO completion port that all these handles
-    // are associated with
-    iocp: HANDLE,
     // the set of receivers in this set
-    receivers: Vec<OsIpcReceiverInternal>,
+    receivers: Vec<OsIpcReceiver>,
+    // the connection OVERLAPPED events
+    receiver_connect_handles: Vec<HANDLE>,
 }
 
 pub enum OsIpcSelectionResult {
@@ -636,62 +516,43 @@ pub enum OsIpcSelectionResult {
 
 impl OsIpcReceiverSet {
     pub fn new() -> Result<OsIpcReceiverSet,WinError> {
-        unsafe {
-            let iocp = kernel32::CreateIoCompletionPort(INVALID_HANDLE_VALUE, ptr::null_mut(), 0, 0);
-            Ok(OsIpcReceiverSet {
-                iocp: iocp,
-                receivers: vec![],
-            })
-        }
+        Ok(OsIpcReceiverSet {
+            receivers: vec![],
+            receiver_connect_handles: vec![],
+        })
     }
 
     pub fn add(&mut self, receiver: OsIpcReceiver) -> Result<i64,WinError> {
-        let mut internal = receiver.take_internal();
-        unsafe {
-            internal.set_iocp(self.iocp);
-        }
-
-        self.receivers.push(internal);
+        self.receiver_connect_handles.push(receiver.connection_event());
+        self.receivers.push(receiver);
 
         // XXX wtf does this return signify? The other impls just return the
-        // fd/mach port as an i64, but we don't have a single one; use the
-        // changed event to do so.
+        // fd/mach port as an i64, but we don't have a single one; so just
+        // return the current len of receivers?
         Ok(self.receivers.len() as i64)
     }
 
     pub fn select(&mut self) -> Result<Vec<OsIpcSelectionResult>,WinError> {
         assert!(self.receivers.len() > 0, "selecting with no objects?");
+        assert!(self.receivers.len() < winapi::MAXIMUM_WAIT_OBJECTS as usize, "trying to select() with too many handles!");
 
         unsafe {
-            let mut ov = winapi::OVERLAPPED_ENTRY {
-                lpCompletionKey: 0,
-                lpOverlapped: ptr::null_mut(),
-                Internal: 0,
-                dwNumberOfBytesTransferred: 0
-            };
-            let mut ovcount: u32 = 0;
-            // do an alertable wait, in case we need to interrupt
-            let ok = kernel32::GetQueuedCompletionStatusEx(self.iocp, &mut ov, 1, &mut ovcount,
-                                                           winapi::INFINITE, winapi::TRUE);
-            let err = WinError::last("GetQueuedCompletionStatusEx");
-            if ok == winapi::FALSE {
-                return Err(err);
+            // the reciever_connect_handles array can only be added to, not removed from
+            let index = kernel32::WaitForMultipleObjectsEx(self.receiver_connect_handles.len() as u32,
+                                                           self.receiver_connect_handles.as_mut_ptr(),
+                                                           winapi::FALSE,
+                                                           winapi::INFINITE,
+                                                           winapi::FALSE);
+
+            if index as usize >= self.receiver_connect_handles.len() {
+                return Err(WinError::last(&format!("WaitForMultipleObjectsEx returned {}", index)));
             }
 
-            let mut results: Vec<OsIpcSelectionResult> = vec![];
-
-            // ov.lpCompletionKey contains the handle that succeeded... let's find it
-            for rs in &mut self.receivers {
-                if rs.find_handle(ov.lpCompletionKey as HANDLE) != -1 {
-                    match rs.complete_select(&ov, true, err.0) {
-                        Ok(r) => results.push(r),
-                        Err(err) => return Err(err),
-                    };
-                    break;
-                }
+            let receiver = &self.receivers[index as usize];
+            match receiver.do_read_transaction() {
+                Ok(r) => Ok(vec![r]),
+                Err(err) => Err(err)
             }
-
-            Ok(results)
         }
     }
 }
@@ -821,15 +682,6 @@ impl OsIpcOneShotServer {
                                     Vec<OsIpcSharedMemory>),WinError> {
         unsafe {
             let mut receiver = self.receiver.borrow_mut().take().unwrap();
-            {
-                let event = receiver.start_connect(0);
-                let rv = kernel32::WaitForSingleObject(event, winapi::INFINITE);
-                if rv == winapi::WAIT_FAILED {
-                    return Err(WinError::last("WaitForSingleObject"));
-                }
-                kernel32::ResetEvent(event);
-            }
-
             let (data, channels, shmems) = try!(receiver.recv());
             Ok((receiver, data, channels, shmems))
         }
@@ -846,46 +698,26 @@ impl OsIpcChannel {
 
 #[derive(PartialEq, Debug)]
 pub struct OsOpaqueIpcChannel {
-    // This handle could be either for a receiver or a sender.
-    // The to_receiver/to_sender functions will turn it in to
-    // the proper type, assuming the remote knows what to expect.
-    receiver: RefCell<Option<OsIpcReceiver>>,
-    sender: RefCell<Option<OsIpcSender>>,
-}
-
-impl Drop for OsOpaqueIpcChannel {
-    fn drop(&mut self) {
-        println!("Should have dropped OsOpaqueIpcChannel");
-//        if self.receiver.is_some() {
-//            self.receiver.unwrap().borrow_mut().
-//        kernel32::CloseHandle(self.receiver.unwrap_or(INVALID_HANDLE_VALUE));
-//        kernel32::CloseHandle(self.sender.unwrap_or(INVALID_HANDLE_VALUE));
-    }
+    is_sender: bool,
+    pipe_id: Uuid,
 }
 
 impl OsOpaqueIpcChannel {
-    fn from_receiver_handles(pipe_id: Uuid, handles: &Vec<HANDLE>, handle_exchange_pid: u32) -> OsOpaqueIpcChannel {
+    fn from_opaque(hh: &OsIpcChannelHandle) -> OsOpaqueIpcChannel {
         OsOpaqueIpcChannel {
-            receiver: RefCell::new(Some(OsIpcReceiver::from_handles(pipe_id, handles, handle_exchange_pid))),
-            sender: RefCell::new(None),
-        }
-    }
-
-    fn from_sender(pipe_id: Uuid, handle_exchange_pid: u32) -> OsOpaqueIpcChannel {
-        OsOpaqueIpcChannel {
-            receiver: RefCell::new(None),
-            sender: RefCell::new(Some(OsIpcSender::connect_inner(pipe_id.to_string(), handle_exchange_pid).unwrap())),
+            is_sender: hh.sender,
+            pipe_id: hh.pipe_id,
         }
     }
 
     pub fn to_receiver(&self) -> OsIpcReceiver {
-        let receiver = mem::replace(&mut *self.receiver.borrow_mut(), None);
-        receiver.unwrap()
+        assert!(!self.is_sender);
+        OsIpcReceiver::from_id(self.pipe_id).unwrap()
     }
 
     pub fn to_sender(&self) -> OsIpcSender {
-        let sender = mem::replace(&mut *self.sender.borrow_mut(), None);
-        sender.unwrap()
+        assert!(self.is_sender);
+        OsIpcSender::connect_pipe_id(self.pipe_id).unwrap()
     }
 }
 

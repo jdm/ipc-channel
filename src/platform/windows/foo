@@ -1,0 +1,203 @@
+struct OsIpcReceiverInternal {
+    // The handle to the current server end of a named pipe
+    handle: HANDLE,
+
+    // The overlapped IO struct
+    overlapped: winapi::OVERLAPPED,
+}
+
+impl Drop for OsIpcReceiverInternal {
+    fn drop(&mut self) {
+        unsafe {
+            kernel32::CloseHandle(self.handle);
+            kernel32::CloseHandle(self.overlapped.hEvent);
+        }
+    }
+}
+
+impl Debug for OsIpcReceiverInternal {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "(OsIpcReceiverInternal)")
+    }
+}
+
+impl PartialEq for OsIpcReceiverInternal {
+    fn eq(&self, other: &OsIpcReceiverInternal) -> bool {
+        self.handle == other.handle
+    }
+}
+
+impl OsIpcReceiverInternal {
+    fn new() -> OsIpcReceiverInternal {
+        unsafe {
+            OsIpcReceiverInternal {
+                handle: INVALID_HANDLE_VALUE,
+                overlapped: create_overlapped(),
+            }
+        }
+    }
+
+    unsafe fn complete_select(&mut self, ov: &winapi::OVERLAPPED_ENTRY, success: bool, win_err: u32) -> Result<OsIpcSelectionResult,WinError> {
+        let handle = ov.lpCompletionKey as HANDLE;
+        // XXX need to check for -1 result
+        let index = self.find_handle(handle) as usize;
+        
+        // was the connection closed?
+        if !success && win_err == winapi::ERROR_HANDLE_EOF {
+            kernel32::CloseHandle(handle);
+            self.handles.swap_remove(index);
+            self.overlappeds.swap_remove(index);
+            return Ok(OsIpcSelectionResult::ChannelClosed(handle as i64));
+        }
+
+        // we have a read that succeeded
+        let result = self.complete_read(handle, index);
+
+        // kick off another read for later completion
+        self.start_read(handle);
+
+        result
+    }
+
+    unsafe fn complete_read(&mut self, handle: HANDLE, index: usize) -> Result<OsIpcSelectionResult,WinError> {
+        // optimistically allocate the read buffer
+        let mut buf: Vec<u8> = vec![0; READ_BUFFER_SIZE as usize];
+        let mut bytes_read: u32 = 0;
+
+        loop {
+            let mut ok = kernel32::ReadFile(handle,
+                                            buf.as_mut_ptr() as winapi::LPVOID,
+                                            buf.len() as u32,
+                                            &mut bytes_read,
+                                            &mut self.overlappeds[index]);
+            let mut err = GetLastError();
+
+            // Is the IO operation pending? If so wait for it to complete, since we know one is available
+            if ok == winapi::FALSE && err == winapi::ERROR_IO_PENDING {
+                ok = kernel32::GetOverlappedResult(handle, &mut self.overlappeds[index], &mut bytes_read, winapi::TRUE);
+                err = GetLastError();
+            }
+
+            // Now handle real errors
+            if ok == winapi::FALSE {
+                // Was the pipe closed?
+                if err == winapi::ERROR_HANDLE_EOF {
+                    return Ok(OsIpcSelectionResult::ChannelClosed(handle as i64));
+                }
+
+                // Do we not have enough space to read the full message?
+                if err == winapi::ERROR_MORE_DATA {
+                    let mut message_size: u32 = 0;
+                    let success = kernel32::PeekNamedPipe(handle, ptr::null_mut(), 0, ptr::null_mut(), ptr::null_mut(), &mut message_size);
+                    assert!(success == winapi::TRUE, "PeekNamedPipe failed");
+
+                    buf.resize(message_size as usize, 0);
+                    continue; // try the read again
+                }
+
+                // Something actually failed for real
+                return Err(WinError(err));
+            }
+
+            // Hey, the read actually succeeded!
+            break;
+        }
+
+        // We now have a complete message in buf! Amazing. \o/
+
+        // deserialize!
+        let mut msg: OsIpcMessage = bincode::serde::deserialize(&buf).unwrap();
+
+        let mut channels: Vec<OsOpaqueIpcChannel> = vec![];
+        let mut shmems: Vec<OsIpcSharedMemory> = vec![];
+        
+        // play with handles!
+        for ch_handle in &mut msg.channel_handles {
+            match ch_handle.receiver {
+                Some(ref handles) => {
+                    let mut our_handles: Vec<HANDLE> = vec![];
+                    for their_handle in handles {
+                        our_handles.push(take_handle_from_process(*their_handle as HANDLE, self.handle_exchange_process_id).unwrap());
+                    }
+                    channels.push(OsOpaqueIpcChannel::from_receiver_handles(ch_handle.pipe_id, &our_handles, self.handle_exchange_process_id));
+                },
+                None => {
+                    channels.push(OsOpaqueIpcChannel::from_sender(ch_handle.pipe_id, self.handle_exchange_process_id));
+                }
+            }
+        }
+
+        for (index,their_handle) in msg.shmem_handles.iter_mut().enumerate() {
+            let our_handle = take_handle_from_process(*their_handle as HANDLE, self.handle_exchange_process_id).unwrap();
+            shmems.push(OsIpcSharedMemory::from_handle(our_handle, msg.shmem_sizes[index] as usize));
+        }
+
+        Ok(OsIpcSelectionResult::DataReceived(handle as i64, msg.data, channels, shmems))
+    }
+
+    unsafe fn start_read(&mut self, handle: HANDLE) -> Result<(),WinError> {
+        let index = self.find_handle(handle) as usize;
+        for n in 1..10 {
+            let ok = kernel32::ReadFile(handle,
+                                        ptr::null_mut(), // read buffer -- NULL, we're not actually going to read
+                                        0, // max number of bytes to read -- 0
+                                        ptr::null_mut(), // out value of number of bytes actually read -- NULL with overlapped IO
+                                        &mut self.overlappeds[index]);
+
+            // grab the actual error code
+            let err = GetLastError();
+
+            // we expect ReadFile to return FALSE -- ideally to get ERROR_IO_PENDING, but also perhaps
+            // ERROR_MORE_DATA if our async read turned into a sync one.  That should never happen
+            // with a named pipe, but it's a possibility.
+            if ok == winapi::FALSE {
+                // the expected result -- async read was queued
+                if err == winapi::ERROR_IO_PENDING {
+                    return Ok(());
+                }
+
+                // If it's ERROR_MORE_DATA or EOF, then we have an actual read that needs to take place.
+                // We don't handle it, instead we tell our IOCP to handle it.
+                if err == winapi::ERROR_MORE_DATA || err == winapi::ERROR_HANDLE_EOF {
+                    kernel32::PostQueuedCompletionStatus(self.active_iocp,
+                                                         0, handle as u64, &mut self.overlappeds[index]);
+                    return Ok(());
+                }
+
+                return Err(WinError(err));
+            }
+
+            // ReadFile succeeded with a read of 0.  The other end must have called Write with num bytes
+            // 0.  What?  Keep looping.
+        }
+
+        panic!("start_read -- went through 10 loops of ReadFile() returning TRUE, what's going on?");
+    }
+
+    fn add_handle(&mut self, handle: HANDLE) -> () {
+        // Create a completion event & OVERLAPPED structure to use for this
+        unsafe {
+            let completion_event = kernel32::CreateEventA(ptr::null_mut(), winapi::FALSE, winapi::FALSE, ptr::null_mut());
+            assert!(completion_event != INVALID_HANDLE_VALUE);
+
+            let mut overlapped = winapi::OVERLAPPED {
+                Internal: 0,
+                InternalHigh: 0,
+                Offset: 0,
+                OffsetHigh: 0,
+                hEvent: completion_event
+            };
+
+            // add the handle and the overlapped struct to vectors
+            self.handles.push(handle);
+            self.overlappeds.push(overlapped);
+
+            if self.active_iocp != INVALID_HANDLE_VALUE {
+                // add it to the active iocp
+                kernel32::CreateIoCompletionPort(handle, self.active_iocp, handle as u64, 0);
+                // kick off a read
+                self.start_read(handle);
+            }
+        }
+    }
+}
