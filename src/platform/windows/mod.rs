@@ -9,7 +9,7 @@
 
 use bincode::serde::DeserializeError;
 use std::mem;
-use std::cmp::{PartialEq};
+use std::cmp::{min, PartialEq};
 use std::io::{Error, ErrorKind};
 use std::fmt::{self, Debug, Formatter};
 use std::ops::Deref;
@@ -21,6 +21,7 @@ use std::ffi::CString;
 use std::sync::{Arc, Mutex};
 use std::marker::{Send, Sync};
 use std::os::raw::c_void;
+use std::thread;
 
 use libc::{c_char, intptr_t};
 
@@ -35,9 +36,11 @@ use kernel32::{GetLastError};
 use user32;
 
 const INVALID_PID: u32 = 0xffffffffu32;
-const READ_BUFFER_SIZE: u32 = 8192;
 const NMPWAIT_WAIT_FOREVER: u32 = 0xffffffffu32;
 const NMPWAIT_NOWAIT: u32 = 0x1u32;
+
+const READ_BUFFER_SIZE: usize = 128 * 1024; //8192;
+const READ_BUFFER_MAX_GROWTH: usize = 1 * 1024 * 1024; // 1MB max growth
 
 pub fn channel() -> Result<(OsIpcSender, OsIpcReceiver),WinError> {
     let mut receiver = try!(OsIpcReceiver::new());
@@ -58,6 +61,8 @@ struct OsIpcChannelHandle {
     sender: bool,
 }
 
+// XXX these should not be vecs; we'll change
+// this around soon anyway
 #[derive(Serialize, Deserialize, Debug)]
 struct OsIpcMessage {
     data: Vec<u8>,
@@ -85,13 +90,20 @@ fn safe_close_handle_cell(handle: &Cell<HANDLE>) -> () {
 }
 
 // duplicate a given handle in the source process to this one, closing it in the source process
+fn get_process_handle(pid: u32) -> Result<HANDLE,WinError> {
+    unsafe {
+        let handle = kernel32::OpenProcess(winapi::PROCESS_DUP_HANDLE, winapi::FALSE, pid);
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(WinError::last("OpenProcess"));
+        }
+        Ok(handle)
+    }
+}
+
 fn take_handle_from_process(handle: HANDLE, source_pid: u32) -> Result<HANDLE,WinError> {
     unsafe {
         let mut newh: HANDLE = INVALID_HANDLE_VALUE;
-        let mut other_process: HANDLE = kernel32::OpenProcess(winapi::PROCESS_DUP_HANDLE, winapi::FALSE, source_pid);
-        if other_process == INVALID_HANDLE_VALUE {
-            return Err(WinError::last("OpenProcess"));
-        }
+        let mut other_process = try!(get_process_handle(source_pid));
 
         let ok = kernel32::DuplicateHandle(other_process, handle,
                                            kernel32::GetCurrentProcess(), &mut newh,
@@ -112,10 +124,7 @@ fn take_handle_from_process(handle: HANDLE, source_pid: u32) -> Result<HANDLE,Wi
 fn dup_handle_for_process(handle: HANDLE, target_pid: u32) -> Result<HANDLE,WinError> {
     unsafe {
         let mut newh: HANDLE = INVALID_HANDLE_VALUE;
-        let mut other_process: HANDLE = kernel32::OpenProcess(winapi::PROCESS_DUP_HANDLE, winapi::FALSE, target_pid);
-        if other_process == INVALID_HANDLE_VALUE {
-            return Err(WinError::last("OpenProcess"));
-        }
+        let mut other_process = try!(get_process_handle(target_pid));
 
         let ok = kernel32::DuplicateHandle(kernel32::GetCurrentProcess(), handle,
                                            other_process, &mut newh,
@@ -168,18 +177,43 @@ macro_rules! take_handle {
 
 fn create_overlapped() -> RefCell<winapi::OVERLAPPED> {
     unsafe {
-        let ev = kernel32::CreateEventA(ptr::null_mut(), winapi::FALSE, winapi::FALSE, ptr::null_mut());
-        assert!(ev != INVALID_HANDLE_VALUE);
+        //let ev = kernel32::CreateEventA(ptr::null_mut(), winapi::FALSE, winapi::FALSE, ptr::null_mut());
+        //assert!(ev != INVALID_HANDLE_VALUE);
         RefCell::new(winapi::OVERLAPPED {
             Internal: 0,
             InternalHigh: 0,
             Offset: 0,
             OffsetHigh: 0,
-            hEvent: ev
+            hEvent: 0 as HANDLE
         })
     }
 }
 
+fn reset_overlapped(ov: &mut winapi::OVERLAPPED) {
+    ov.Internal = 0;
+    ov.InternalHigh = 0;
+    ov.Offset = 0;
+    ov.OffsetHigh = 0;
+}
+
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ServerState {
+    // the named pipe has been created, but it is not connected
+    // or will not be connected to anything
+    Disconnected,
+    // a ConnectNamedPipe has been issued, but has not completed yet
+    ConnectInProgress,
+    // a ConnectNamedPipe has completed, and this server is connected.
+    // next: ReadInProgress, Disconnected
+    Connected,
+    // a ReadFile has been issued, but has not completed yet
+    // next: ReadComplete
+    ReadInProgress,
+    // a ReadFile has completed, and its data has not been consumed
+    // next: ReadInProgress, Connected, Disconnected
+    ReadComplete,
+}
 
 #[derive(Debug)]
 pub struct OsIpcReceiver {
@@ -191,6 +225,21 @@ pub struct OsIpcReceiver {
 
     // The handle to the current server end of a named pipe
     handle: HANDLE,
+
+    // The state that this server is in, which will also
+    // indicate what the overlapped IO struct below is
+    // waiting on, if anything
+    state: Cell<ServerState>,
+
+    // The OVERLAPPED struct for async IO
+    ov: RefCell<winapi::OVERLAPPED>,
+
+    // A read buffer for any pending reads
+    read_buf: RefCell<Vec<u8>>,
+
+    // the size of the last read that completed sync;
+    // only valid if state == ReadComplete
+    last_read_size: Cell<u32>,
 }
 
 
@@ -199,6 +248,7 @@ unsafe impl Sync for OsIpcReceiver { }
 
 impl PartialEq for OsIpcReceiver {
     fn eq(&self, other: &OsIpcReceiver) -> bool {
+        // XXX it should be enough to check any one of these
         self.pipe_id == other.pipe_id &&
         self.pipe_name == other.pipe_name &&
         self.handle == other.handle
@@ -208,12 +258,22 @@ impl PartialEq for OsIpcReceiver {
 impl Drop for OsIpcReceiver {
     fn drop(&mut self) {
         unsafe {
+            kernel32::CancelIoEx(self.handle, self.ov.borrow_mut().deref_mut());
             kernel32::CloseHandle(self.handle);
         }
     }
 }
 
 impl OsIpcReceiver {
+    fn new() -> Result<OsIpcReceiver,WinError> {
+        let pipe_id = make_pipe_id();
+        OsIpcReceiver::from_id(pipe_id)
+    }
+
+    fn sender(&mut self) -> Result<OsIpcSender,WinError> {
+        OsIpcSender::connect_pipe_id(self.pipe_id)
+    }
+
     fn from_id(pipe_id: Uuid) -> Result<OsIpcReceiver,WinError> {
         unsafe {
             let pipe_name = make_pipe_name(&pipe_id);
@@ -221,11 +281,11 @@ impl OsIpcReceiver {
             // create the pipe server
             let hserver =
                 kernel32::CreateNamedPipeA(pipe_name.as_ptr(),
-                                           winapi::PIPE_ACCESS_DUPLEX,
-                                           winapi::PIPE_TYPE_BYTE | winapi::PIPE_READMODE_BYTE | winapi::PIPE_NOWAIT,
+                                           winapi::PIPE_ACCESS_INBOUND | winapi::FILE_FLAG_OVERLAPPED,
+                                           winapi::PIPE_TYPE_BYTE | winapi::PIPE_READMODE_BYTE,
                                            winapi::PIPE_UNLIMITED_INSTANCES | winapi::PIPE_REJECT_REMOTE_CLIENTS,
                                            4096, 4096, // out/in buffer sizes
-                                           0, // default timeout
+                                           0, // default timeout for WaitNamedPipe (0 == 50ms as default)
                                            ptr::null_mut());
             if hserver == INVALID_HANDLE_VALUE {
                 return Err(WinError::last("CreateNamedPipeA"));
@@ -235,70 +295,223 @@ impl OsIpcReceiver {
                 handle: hserver,
                 pipe_id: pipe_id,
                 pipe_name: pipe_name,
+                state: Cell::new(ServerState::Disconnected),
+                ov: create_overlapped(),
+                read_buf: RefCell::new(Vec::with_capacity(READ_BUFFER_SIZE)),
+                last_read_size: Cell::new(0),
             };
+
+            try!(rec.start_accept());
 
             Ok(rec)
         }
     }
 
-    fn new() -> Result<OsIpcReceiver,WinError> {
-        let pipe_id = make_pipe_id();
-        OsIpcReceiver::from_id(pipe_id)
+    // The handle that we should wait for being signalled on; if we
+    // use NULL for hEvent in the OVERLAPPED structure, then the named
+    // pipe handle itself is signalled.  That can be a bad idea with
+    // complex IO, but we have straightforward IO so we know what
+    // will have completed each time.
+    fn wait_handle(&self) -> HANDLE {
+        self.handle
     }
 
-    unsafe fn do_read(&self) -> Result<OsIpcSelectionResult,WinError> {
-        println!("do_read");
-        // optimistically allocate the read buffer
-        let mut buf: Vec<u8> = Vec::with_capacity(READ_BUFFER_SIZE as usize);
-        let mut channel_closed: bool = false;
-        let mut bytes_read: u32 = 0;
+    fn io_completed(&self) -> bool {
+        assert!(self.state.get() == ServerState::ConnectInProgress || self.state.get() == ServerState::ReadInProgress);
+        self.ov.borrow().Internal != (winapi::STATUS_PENDING as u64)
+    }
+    
+    // Start an asynchronous pipe connect
+    fn start_accept(&mut self) -> Result<(),WinError> {
+        println!("> start_accept");
+        unsafe {
+            let mut ov = self.ov.borrow_mut();
+            reset_overlapped(ov.deref_mut());
 
-        loop {
-            let dest_ptr = buf.as_mut_ptr() as winapi::LPVOID;
-            let mut ok = kernel32::ReadFile(self.handle,
-                                            dest_ptr.offset(buf.len() as isize),
-                                            (buf.capacity() - buf.len()) as u32,
-                                            &mut bytes_read,
-                                            ptr::null_mut());
-            if ok == winapi::TRUE {
-                let new_size = buf.len() + bytes_read as usize;
-                buf.set_len(new_size);
-                println!("ReadFile read {} bytes -- total {}", bytes_read, buf.len());
+            let ok = kernel32::ConnectNamedPipe(self.handle,
+                                                ov.deref_mut());
+            // we should always get IO_PENDING or PIPE_CONNECTED with
+            // OVERLAPPED
+            assert!(ok == 0);
+            let err = GetLastError();
+            match (ok,err) {
+                (0,winapi::ERROR_IO_PENDING) => {
+                    self.state.set(ServerState::ConnectInProgress);
+                    println!("< start_accept");
+                    Ok(())
+                },
+                (0,winapi::ERROR_PIPE_CONNECTED) => {
+                    self.state.set(ServerState::Connected);
+                    println!("< start_accept");
+                    Ok(())
+                },
+                (_,_) =>
+                    Err(WinError::last("ConnectNamedPipe"))
+            }
+        }
+    }
 
-                // we could have read more, but we didn't; assume done
-                if buf.len() < buf.capacity() {
-                    break;
+    // Finish an asynchronous pipe connect, returning true or false
+    // indicating if the pipe is connected.  If block is specified,
+    // block until the pipe is connected (or error).  If block is false,
+    // will return immediately.
+    fn finish_accept(&self, block: bool) -> Result<bool,WinError> {
+        println!("> finish_accept");
+
+        // If we already connected (perhaps in start_connect), then
+        // we're done
+        if self.state.get() == ServerState::Connected {
+            println!("< finish_accept (true)");
+            return Ok(true);
+        }
+
+        // The only valid state is ConnectInProgress at this point
+        assert!(self.state.get() == ServerState::ConnectInProgress);
+
+        // If the IO operation is complete, we're connected; return
+        // true.
+        if self.io_completed() {
+            self.state.set(ServerState::Connected);
+            println!("< finish_accept (true)");
+            return Ok(true);
+        }
+
+        unsafe {
+            let mut ov = self.ov.borrow_mut();
+            let mut dummy: u32 = 0;
+            let ok = kernel32::GetOverlappedResult(self.handle, ov.deref_mut(), &mut dummy, block as i32);
+            if ok == 0 {
+                let err = GetLastError();
+                if err == winapi::ERROR_IO_INCOMPLETE {
+                    println!("< finish_accept (false)");
+                    return Ok(false);
                 }
-
-                // extend and grow
-                let len = buf.capacity();
-                buf.reserve(len);
-            } else {
-                // Now handle real errors
-                let mut err = GetLastError();
-
-                // Was the pipe closed?
-                if err == winapi::ERROR_HANDLE_EOF || err == winapi::ERROR_BROKEN_PIPE {
-                    channel_closed = true;
-                    break;
-                }
-
-                // Something actually failed for real
-                return Err(WinError::from_system(err, "ReadFile"));
+                return Err(WinError::last("GetOverlappedResult"));
             }
         }
 
-        // Hey, the read actually succeeded!
+        self.state.set(ServerState::Connected);
+        println!("< finish_accept (true)");
+        Ok(true)
+    }
 
-        // XXX we may want to avoid this shrink to fit since we're
-        // just going to deserialize and throw this away soon anyway
-        buf.shrink_to_fit();
+    // kick off an asynchronous read
+    fn start_read(&self) -> Result<(),WinError> {
+        println!("start_read");
 
-        // if channel_closed:
-        // return Ok(OsIpcSelectionResult::ChannelClosed(self.handle as i64));
-        // We now have a complete message in buf! Amazing. \o/
+        // If we already have a read in flight, we're done
+        if self.state.get() == ServerState::ReadInProgress {
+            return Ok(());
+        }
 
-        // deserialize!
+        assert!(self.state.get() == ServerState::Connected);
+
+        unsafe {
+            let mut buf = self.read_buf.borrow_mut();
+            let mut ov = self.ov.borrow_mut();
+            reset_overlapped(ov.deref_mut());
+
+            // if the buffer is full, add more space
+            if buf.capacity() == buf.len() {
+                let more = min(buf.capacity(), READ_BUFFER_MAX_GROWTH);
+                buf.reserve(more);
+            }
+
+            let buf_ptr = buf.deref_mut().as_mut_ptr() as winapi::LPVOID;
+            let mut bytes_read: u32 = 0;
+            let ok = kernel32::ReadFile(self.handle,
+                                        buf_ptr.offset(buf.len() as isize),
+                                        (buf.capacity() - buf.len()) as u32,
+                                        &mut bytes_read,
+                                        //ptr::null_mut(),
+                                        ov.deref_mut());
+            if ok == winapi::TRUE {
+                // the read completed synchronously, because windows
+                let new_size = buf.len() + bytes_read as usize;
+                buf.set_len(new_size);
+                self.last_read_size.set(bytes_read);
+                self.state.set(ServerState::ReadComplete);
+            } else {
+                if GetLastError() != winapi::ERROR_IO_PENDING {
+                    return Err(WinError::last("ReadFile"));
+                }
+                self.state.set(ServerState::ReadInProgress);
+            }
+        }
+
+        Ok(())
+    }
+
+    // Finish reading into self.read_buf. Returns true
+    // if a read actually happened; false if it's still in progress.
+    fn finish_read(&self, block: bool) -> Result<bool,WinError> {
+        println!("finish_read");
+
+        if self.state.get() == ServerState::ReadComplete {
+            // or previous read start actually completed synchronously; just
+            // report success or failure here
+            self.state.set(ServerState::Connected);
+            return Ok((self.last_read_size.get() != 0));
+        }
+
+        assert!(self.state.get() == ServerState::ReadInProgress);
+
+        unsafe {
+            let mut ov = self.ov.borrow_mut();
+            let mut bytes_read: u32 = 0;
+            let ok = kernel32::GetOverlappedResult(self.handle, ov.deref_mut(), &mut bytes_read, block as i32);
+            if ok == 0 {
+                match GetLastError() {
+                    winapi::ERROR_IO_INCOMPLETE =>
+                        return Ok(false),
+                    winapi::ERROR_BROKEN_PIPE => {
+                        self.state.set(ServerState::Disconnected);
+                        return Ok(false);
+                    },
+                    _ =>
+                        return Err(WinError::last("GetOverlappedResult"))
+                }
+            }
+
+            let mut buf = self.read_buf.borrow_mut();
+            let new_size = buf.len() + bytes_read as usize;
+            buf.set_len(new_size);
+
+            println!("finish_read: read {} bytes -- total {}", bytes_read, buf.len());
+            self.state.set(ServerState::Connected);
+            Ok((bytes_read != 0))
+        }
+    }
+
+    fn do_read(&self, block: bool) -> Result<OsIpcSelectionResult,WinError> {
+        println!("do_read");
+
+        if self.state.get() == ServerState::Disconnected {
+            return Ok(OsIpcSelectionResult::ChannelClosed(self.handle as i64));
+        }
+
+        // read until we can't read no more
+        // Only the first read should block; subsequent ones should
+        // be nonblocking
+        let mut do_block = block;
+        loop {
+            try!(self.start_read());
+
+            if try!(self.finish_read(do_block)) {
+                do_block = false;
+                continue;
+            }
+
+            if self.read_buf.borrow().len() > 0 {
+                break;
+            }
+        }
+
+        // Sweet, we got a buffer
+
+        let mut buf = self.read_buf.borrow_mut();
+
+        // deserialize
         let mut msg: OsIpcMessage = match bincode::serde::deserialize(&buf) {
             Ok(m) => m,
             Err(err) => return Err(WinError(0xffffffffu32))
@@ -317,123 +530,35 @@ impl OsIpcReceiver {
         Ok(OsIpcSelectionResult::DataReceived(self.handle as i64, msg.data, channels, shmems))
     }
 
-    // This is called when we know we have a connection ready; we're going to
-    // connect, read, and close all in one go.
-    fn do_read_transaction(&self) -> Result<OsIpcSelectionResult, WinError>
-    {
-        //assert!(self.connection_ready());
-        println!("do_read_transaction");
-        unsafe {
-            let mut ok = kernel32::ConnectNamedPipe(self.handle, ptr::null_mut());
-
-            // if we're in do_read_transaction, we should already know we have
-            // a connected client
-            //assert!(ok == winapi::FALSE && kernel32::GetLastError() == winapi::ERROR_PIPE_CONNECTED);
-
-            let result = self.do_read();
-
-            // close!
-            ok = kernel32::DisconnectNamedPipe(self.handle);
-            if ok == winapi::FALSE {
-                return Err(WinError::last("DisconnectNamedPipe"));
-            }
-
-            result
-        }
-    }
-
-    // This function connects the server end of a named pipe, and starts it
-    // listening for a connection using CreateFile, and returns th
-    fn try_accept(&self) -> Result<bool,WinError> {
-        unsafe {
-            println!("try_accept");
-            let ok = kernel32::ConnectNamedPipe(self.handle, ptr::null_mut());
-            let err = kernel32::GetLastError();
-            println!("ConnectNamedPipe: ok {}, err {}", ok, err);
-            if ok == winapi::FALSE &&
-                (err == winapi::ERROR_PIPE_CONNECTED || err == winapi::ERROR_NO_DATA) {
-                return Ok(true);
-            }
-
-            if ok == winapi::TRUE || err == winapi::ERROR_PIPE_LISTENING {
-                return Ok(false);
-            }
-
-            return Err(WinError::from_system(err, "ConnectNamedPipe"));
-        }
-    }
-
-    fn wait_accept(&self) -> Result<(),WinError> {
-        unsafe {
-            println!("wait_accept");
-            let mut mode: u32 = winapi::PIPE_WAIT;
-            let mut ok: i32;
-
-            ok = kernel32::SetNamedPipeHandleState(self.handle, &mut mode, ptr::null_mut(), ptr::null_mut());
-            if ok == winapi::FALSE {
-                return Err(WinError::last("SetNamedPipeHandleState"));
-            }
-
-            ok = kernel32::ConnectNamedPipe(self.handle, ptr::null_mut());
-            if ok == winapi::FALSE {
-                // XXX should we put the pipe state baack to NOWAIT, or is this
-                // error going to be fatal?
-                return Err(WinError::last("ConnectNamedPipe"));
-            }
-
-            mode = winapi::PIPE_NOWAIT;
-            ok = kernel32::SetNamedPipeHandleState(self.handle, &mut mode, ptr::null_mut(), ptr::null_mut());
-            if ok == winapi::FALSE {
-                return Err(WinError::last("SetNamedPipeHandleState"));
-            }
-
-            Ok(())
-        }
-    }
-
-    fn sender(&mut self) -> Result<OsIpcSender,WinError> {
-        OsIpcSender::connect_pipe_id(self.pipe_id)
-    }
-
     pub fn consume(&self) -> OsIpcReceiver {
-        // we should probably close self.handle etc.
-        // and create an entirely new pipe; just
-        // OsIpcReceiver::from_id(self.pipe_id)
-        OsIpcReceiver {
-            handle: self.handle,
-            pipe_id: self.pipe_id,
-            pipe_name: self.pipe_name.clone(),
-        }
+        println!("consume is broken!");
+        // XXX we need to dup all our handles over to the new one
+        OsIpcReceiver::from_id(self.pipe_id).unwrap()
     }
 
     pub fn recv(&self)
                 -> Result<(Vec<u8>, Vec<OsOpaqueIpcChannel>, Vec<OsIpcSharedMemory>),WinError> {
-        unsafe {
-            println!("recv");
-            if let Err(error) = self.wait_accept() {
-                return Err(error)
-            }
+        println!("recv");
+        if try!(self.finish_accept(true)) == false {
+            return Err(WinError::last("blocking accept returned false?"));
+        }
 
-            match self.do_read_transaction() {
-                Ok(r) => match r {
-                    OsIpcSelectionResult::DataReceived(_, a, b, c) => Ok((a, b, c)),
-                    OsIpcSelectionResult::ChannelClosed(_) => Err(WinError::last("Channel closed?")),
-                },
-                Err(err) => Err(err)
-            }
+        match try!(self.do_read(true)) {
+            OsIpcSelectionResult::DataReceived(_, a, b, c) => Ok((a, b, c)),
+            OsIpcSelectionResult::ChannelClosed(_) => Err(WinError::last("Channel closed?")),
         }
     }
 
     pub fn try_recv(&self)
                     -> Result<(Vec<u8>, Vec<OsOpaqueIpcChannel>, Vec<OsIpcSharedMemory>),WinError> {
         println!("try_recv");
-        match self.try_accept() {
-            // something connected? good, receive
-            Ok(true) => self.recv(),
-            // nothing connected? empty!
-            Ok(false) => Ok((vec![], vec![], vec![])),
-            // error? error!
-            Err(error) => Err(error)
+        if try!(self.finish_accept(false)) == false {
+            return Ok((vec![], vec![], vec![]));
+        }
+
+        match try!(self.do_read(false)) {
+            OsIpcSelectionResult::DataReceived(_, a, b, c) => Ok((a, b, c)),
+            OsIpcSelectionResult::ChannelClosed(_) => Err(WinError::last("Channel closed?")),
         }
     }
 }
@@ -442,6 +567,7 @@ impl OsIpcReceiver {
 pub struct OsIpcSender {
     pipe_id: Uuid,
     pipe_name: CString,
+    handle: HANDLE,
 }
 
 unsafe impl Send for OsIpcSender { }
@@ -460,16 +586,51 @@ impl Clone for OsIpcSender {
     }
 }
 
+impl Drop for OsIpcSender {
+    fn drop(&mut self) {
+        unsafe {
+            kernel32::CloseHandle(self.handle);
+            self.handle = INVALID_HANDLE_VALUE;
+        }
+    }
+}
+
 impl OsIpcSender {
     fn connect_pipe_id(pipe_id: Uuid) -> Result<OsIpcSender,WinError> {
-        Ok(OsIpcSender {
+        let mut result = OsIpcSender {
             pipe_id: pipe_id,
             pipe_name: make_pipe_name(&pipe_id),
-        })
+            handle: INVALID_HANDLE_VALUE,
+        };
+
+        try!(result.connect_to_server());
+
+        Ok(result)
     }
 
     pub fn connect(name: String) -> Result<OsIpcSender,WinError> {
         OsIpcSender::connect_pipe_id(Uuid::parse_str(&name).unwrap())
+    }
+
+    // Connect to a pipe server
+    fn connect_to_server(&mut self) -> Result<(),WinError> {
+        unsafe {
+            let handle =
+                kernel32::CreateFileA(self.pipe_name.as_ptr(),
+                                      winapi::GENERIC_WRITE,
+                                      0,
+                                      ptr::null_mut(), // lpSecurityAttributes
+                                      winapi::OPEN_EXISTING,
+                                      winapi::FILE_ATTRIBUTE_NORMAL,
+                                      ptr::null_mut());
+            if handle == INVALID_HANDLE_VALUE {
+                return Err(WinError::last("CreateFileA"));
+            }
+
+            self.handle = handle;
+        }
+
+        Ok(())
     }
 
     pub fn send(&self,
@@ -477,6 +638,9 @@ impl OsIpcSender {
                 ports: Vec<OsIpcChannel>,
                 shared_memory_regions: Vec<OsIpcSharedMemory>)
                 -> Result<(),WinError> {
+        println!(">send");
+        assert!(self.handle != INVALID_HANDLE_VALUE);
+
         unsafe {
             let channel_handles: Vec<OsIpcChannelHandle> = vec![];
             let shmem_sizes: Vec<u64> = vec![];
@@ -497,35 +661,12 @@ impl OsIpcSender {
             // ... but we're not using CallNamedPipe
             //assert!(bytes.len() < (64 * 1024));
 
-            let h =
-                kernel32::CreateFileA(self.pipe_name.as_ptr(),
-                                      winapi::GENERIC_WRITE,
-                                      0,
-                                      ptr::null_mut(), // lpSecurityAttributes
-                                      winapi::OPEN_EXISTING,
-                                      winapi::FILE_ATTRIBUTE_NORMAL,
-                                      ptr::null_mut());
-            if h == INVALID_HANDLE_VALUE {
-                return Err(WinError::last("CreateFileA"));
-            }
-
-            let mut mode: u32 = winapi::PIPE_WAIT;
-            ok = kernel32::SetNamedPipeHandleState(h, &mut mode, ptr::null_mut(), ptr::null_mut());
-            if ok == winapi::FALSE {
-                return Err(WinError::last("SetNamedPipeHandleState"));
-            }
-
-            // XXX this is ridiculous, having to write a separate u32
-            // just to represent to size of the message is *ugh*.  We can't
-            // use message mode, because there's a 64k limit to message size
-            // 
-
             let mut nwritten: u32 = 0;
             let mut ntowrite: u32 = bytes.len() as u32;
             let bytesptr = bytes.as_ptr() as *mut c_void;
             while nwritten < ntowrite {
                 let mut nwrote: u32 = 0;
-                if kernel32::WriteFile(h,
+                if kernel32::WriteFile(self.handle,
                                        bytesptr.offset(nwritten as isize),
                                        ntowrite,
                                        &mut nwrote,
@@ -538,9 +679,6 @@ impl OsIpcSender {
                 ntowrite -= nwrote;
                 println!("Just wrote {} bytes, left {}/{} err {}", nwrote, nwritten, bytes.len(), GetLastError());
             }
-
-            // aaand disconnect
-            kernel32::CloseHandle(h);
         }
 
         Ok(())
@@ -594,7 +732,7 @@ impl OsIpcReceiverSet {
             }
 
             let receiver = &self.receivers[index as usize];
-            match receiver.do_read_transaction() {
+            match receiver.do_read(false) {
                 Ok(r) => Ok(vec![r]),
                 Err(err) => Err(err)
             }
