@@ -634,52 +634,61 @@ impl OsIpcSender {
     }
 
     pub fn send(&self,
-                data: &[u8],
+                in_data: &[u8],
                 ports: Vec<OsIpcChannel>,
                 shared_memory_regions: Vec<OsIpcSharedMemory>)
                 -> Result<(),WinError> {
         println!(">send");
         assert!(self.handle != INVALID_HANDLE_VALUE);
 
-        unsafe {
-            let channel_handles: Vec<OsIpcChannelHandle> = vec![];
-            let shmem_sizes: Vec<u64> = vec![];
-            let shmem_handles: Vec<intptr_t> = vec![];
-            let mut ok: i32 = 0;
+        let handle = self.handle as intptr_t;
+        // XXX we have to make a copy of the data here because we're going
+        // to use a thread to do the write.  This isn't ideal.
+        let data = in_data.to_vec();
 
-            let msg = OsIpcMessage {
-                data: data.to_vec(),
-                channel_handles: channel_handles,
-                shmem_source_pid: kernel32::GetCurrentProcessId(),
-                shmem_sizes: shmem_sizes,
-                shmem_handles: shmem_handles
-            };
-
-            let bytes = bincode::serde::serialize(&msg, bincode::SizeLimit::Infinite).unwrap();
-
-            // 64k is the max size that is guaranteed to be able to be sent in a single transaction
-            // ... but we're not using CallNamedPipe
-            //assert!(bytes.len() < (64 * 1024));
-
-            let mut nwritten: u32 = 0;
-            let mut ntowrite: u32 = bytes.len() as u32;
-            let bytesptr = bytes.as_ptr() as *mut c_void;
-            while nwritten < ntowrite {
-                let mut nwrote: u32 = 0;
-                if kernel32::WriteFile(self.handle,
-                                       bytesptr.offset(nwritten as isize),
-                                       ntowrite,
-                                       &mut nwrote,
-                                       ptr::null_mut())
-                    == winapi::FALSE
-                {
-                    return Err(WinError::last("WriteFile"));
+        thread::spawn(move || {
+            unsafe {
+                let channel_handles: Vec<OsIpcChannelHandle> = vec![];
+                let shmem_sizes: Vec<u64> = vec![];
+                let shmem_handles: Vec<intptr_t> = vec![];
+                let mut ok: i32 = 0;
+    
+                let msg = OsIpcMessage {
+                    data: data,
+                    channel_handles: channel_handles,
+                    shmem_source_pid: kernel32::GetCurrentProcessId(),
+                    shmem_sizes: shmem_sizes,
+                    shmem_handles: shmem_handles
+                };
+    
+                let bytes = bincode::serde::serialize(&msg, bincode::SizeLimit::Infinite).unwrap();
+    
+                // 64k is the max size that is guaranteed to be able to be sent in a single transaction
+                // ... but we're not using CallNamedPipe
+                //assert!(bytes.len() < (64 * 1024));
+    
+                let mut nwritten: u32 = 0;
+                let mut ntowrite: u32 = bytes.len() as u32;
+                let bytesptr = bytes.as_ptr() as *mut c_void;
+                while nwritten < ntowrite {
+                    let mut nwrote: u32 = 0;
+                    if kernel32::WriteFile(handle as HANDLE,
+                                           bytesptr.offset(nwritten as isize),
+                                           ntowrite,
+                                           &mut nwrote,
+                                           ptr::null_mut())
+                        == winapi::FALSE
+                    {
+                        // this will println!
+                        WinError::last("WriteFile");
+                        return;
+                    }
+                    nwritten += nwrote;
+                    ntowrite -= nwrote;
+                    println!("Just wrote {} bytes, left {}/{} err {}", nwrote, nwritten, bytes.len(), GetLastError());
                 }
-                nwritten += nwrote;
-                ntowrite -= nwrote;
-                println!("Just wrote {} bytes, left {}/{} err {}", nwrote, nwritten, bytes.len(), GetLastError());
             }
-        }
+        });
 
         Ok(())
     }
