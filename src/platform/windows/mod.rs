@@ -7,40 +7,46 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use bincode::serde::DeserializeError;
-use std::mem;
+use std::cell::{Cell, RefCell};
 use std::cmp::{min, PartialEq};
-use std::io::{Error, ErrorKind};
+use std::default::Default;
+use std::ffi::CString;
 use std::fmt::{self, Debug, Formatter};
+use std::io::{Error, ErrorKind};
+use std::marker::{Send, Sync};
+use std::mem;
 use std::ops::Deref;
+use std::ops::DerefMut;
+use std::os::raw::c_void;
 use std::ptr;
 use std::slice;
-use std::cell::{Cell, RefCell};
-use std::ops::DerefMut;
-use std::ffi::CString;
 use std::sync::{Arc, Mutex};
-use std::marker::{Send, Sync};
-use std::os::raw::c_void;
 use std::thread;
 
-use libc::{c_char, intptr_t};
+use libc::{intptr_t};
 
 use uuid::Uuid;
+
 use bincode;
-use serde::ser::Serialize;
+use bincode::serde::DeserializeError;
 
 use winapi;
 use winapi::{HANDLE, INVALID_HANDLE_VALUE};
 use kernel32;
-use kernel32::{GetLastError};
-use user32;
 
 const INVALID_PID: u32 = 0xffffffffu32;
-const NMPWAIT_WAIT_FOREVER: u32 = 0xffffffffu32;
-const NMPWAIT_NOWAIT: u32 = 0x1u32;
+//const NMPWAIT_WAIT_FOREVER: u32 = 0xffffffffu32;
+//const NMPWAIT_NOWAIT: u32 = 0x1u32;
 
 const READ_BUFFER_SIZE: usize = 128 * 1024; //8192;
 const READ_BUFFER_MAX_GROWTH: usize = 1 * 1024 * 1024; // 1MB max growth
+
+#[allow(non_snake_case)]
+fn GetLastError() -> u32 {
+    unsafe {
+        kernel32::GetLastError()
+    }
+}
 
 pub fn channel() -> Result<(OsIpcSender, OsIpcReceiver),WinError> {
     let mut receiver = try!(OsIpcReceiver::new());
@@ -80,6 +86,7 @@ fn make_pipe_name(pipe_id: &Uuid) -> CString {
     CString::new(format!("\\\\.\\pipe\\rust-ipc-{}", pipe_id.to_string())).unwrap()
 }
 
+#[allow(dead_code)]
 fn safe_close_handle_cell(handle: &Cell<HANDLE>) -> () {
     unsafe {
         if handle.get() != INVALID_HANDLE_VALUE {
@@ -90,6 +97,7 @@ fn safe_close_handle_cell(handle: &Cell<HANDLE>) -> () {
 }
 
 // duplicate a given handle in the source process to this one, closing it in the source process
+#[allow(dead_code)]
 fn get_process_handle(pid: u32) -> Result<HANDLE,WinError> {
     unsafe {
         let handle = kernel32::OpenProcess(winapi::PROCESS_DUP_HANDLE, winapi::FALSE, pid);
@@ -100,10 +108,11 @@ fn get_process_handle(pid: u32) -> Result<HANDLE,WinError> {
     }
 }
 
+#[allow(dead_code)]
 fn take_handle_from_process(handle: HANDLE, source_pid: u32) -> Result<HANDLE,WinError> {
     unsafe {
         let mut newh: HANDLE = INVALID_HANDLE_VALUE;
-        let mut other_process = try!(get_process_handle(source_pid));
+        let other_process = try!(get_process_handle(source_pid));
 
         let ok = kernel32::DuplicateHandle(other_process, handle,
                                            kernel32::GetCurrentProcess(), &mut newh,
@@ -121,10 +130,11 @@ fn take_handle_from_process(handle: HANDLE, source_pid: u32) -> Result<HANDLE,Wi
 }
 
 // duplicate a given handle from this process to the target one
+#[allow(dead_code)]
 fn dup_handle_for_process(handle: HANDLE, target_pid: u32) -> Result<HANDLE,WinError> {
     unsafe {
         let mut newh: HANDLE = INVALID_HANDLE_VALUE;
-        let mut other_process = try!(get_process_handle(target_pid));
+        let other_process = try!(get_process_handle(target_pid));
 
         let ok = kernel32::DuplicateHandle(kernel32::GetCurrentProcess(), handle,
                                            other_process, &mut newh,
@@ -142,6 +152,7 @@ fn dup_handle_for_process(handle: HANDLE, target_pid: u32) -> Result<HANDLE,WinE
 }
 
 // duplicate a handle in the current process
+#[allow(dead_code)]
 fn dup_handle(handle: HANDLE) -> Result<HANDLE,WinError> {
     unsafe {
         let mut newh: HANDLE = INVALID_HANDLE_VALUE;
@@ -449,7 +460,7 @@ impl OsIpcReceiver {
     // Finish reading into self.read_buf. Returns true
     // if a read actually happened; false if it's still in progress.
     fn finish_read(&self, block: bool) -> Result<bool,WinError> {
-        println!("finish_read");
+        println!("finish_read (cur state {:?})", self.state.get());
 
         if self.state.get() == ServerState::ReadComplete {
             // or previous read start actually completed synchronously; just
@@ -470,7 +481,7 @@ impl OsIpcReceiver {
                         return Ok(false),
                     winapi::ERROR_BROKEN_PIPE => {
                         println!("finish_read GetOverlappedResult -> BROKEN_PIPE!");
-                        self.state.set(ServerState::Disconnected);
+                        //self.state.set(ServerState::Disconnected);
                         return Ok(false);
                     },
                     _ =>
@@ -489,7 +500,7 @@ impl OsIpcReceiver {
     }
 
     unsafe fn do_read(&self, block: bool) -> Result<OsIpcSelectionResult,WinError> {
-        println!("do_read");
+        println!("do_read (block {})", block);
 
         if self.state.get() == ServerState::Disconnected {
             return Ok(OsIpcSelectionResult::ChannelClosed(self.handle as i64));
@@ -498,7 +509,7 @@ impl OsIpcReceiver {
         // read until we get the expected number of bytes
         let mut do_block = block;
         let mut read_header: bool = false;
-        let HEADER_SIZE: usize = 8*2;
+        const HEADER_SIZE: usize = 8*2;
         let mut bytes_to_read: usize = HEADER_SIZE; // this is the minimum number of bytes we need to read
 
         let mut data_bytes: usize = 0;
@@ -598,11 +609,49 @@ impl OsIpcReceiver {
     }
 }
 
+#[derive(Debug, PartialEq)]
+struct WinHandle {
+    h: HANDLE
+}
+
+unsafe impl Send for WinHandle { }
+unsafe impl Sync for WinHandle { }
+
+impl Drop for WinHandle {
+    fn drop(&mut self) {
+        unsafe {
+            if self.h != INVALID_HANDLE_VALUE {
+                kernel32::CloseHandle(self.h);
+            }
+        }
+    }
+}
+
+impl Default for WinHandle {
+    fn default() -> WinHandle {
+        WinHandle { h: INVALID_HANDLE_VALUE }
+    }
+}
+
+impl WinHandle {
+    fn new(h: HANDLE) -> WinHandle {
+        WinHandle { h: h }
+    }
+
+    fn valid(&self) -> bool {
+        self.h != INVALID_HANDLE_VALUE
+    }
+
+    fn as_win(&self) -> HANDLE {
+        self.h
+    }
+}
+
 #[derive(Debug)]
 pub struct OsIpcSender {
     pipe_id: Uuid,
     pipe_name: CString,
-    handle: HANDLE,
+    handle: RefCell<Arc<WinHandle>>,
 }
 
 unsafe impl Send for OsIpcSender { }
@@ -611,22 +660,15 @@ unsafe impl Sync for OsIpcSender { }
 impl PartialEq for OsIpcSender {
     fn eq(&self, other: &OsIpcSender) -> bool {
         self.pipe_id == other.pipe_id &&
-        self.pipe_name == other.pipe_name
+        self.pipe_name == other.pipe_name &&
+        self.handle == other.handle
     }
 }
 
 impl Clone for OsIpcSender {
     fn clone(&self) -> OsIpcSender {
+        println!("Sender CLONE!");
         OsIpcSender::connect_pipe_id(self.pipe_id).unwrap()
-    }
-}
-
-impl Drop for OsIpcSender {
-    fn drop(&mut self) {
-        unsafe {
-            kernel32::CloseHandle(self.handle);
-            self.handle = INVALID_HANDLE_VALUE;
-        }
     }
 }
 
@@ -635,7 +677,7 @@ impl OsIpcSender {
         let mut result = OsIpcSender {
             pipe_id: pipe_id,
             pipe_name: make_pipe_name(&pipe_id),
-            handle: INVALID_HANDLE_VALUE,
+            handle: RefCell::new(Arc::new(WinHandle::default())),
         };
 
         try!(result.connect_to_server());
@@ -648,7 +690,8 @@ impl OsIpcSender {
     }
 
     // Connect to a pipe server
-    fn connect_to_server(&mut self) -> Result<(),WinError> {
+    fn connect_to_server(&self) -> Result<(),WinError> {
+        println!("> connect_to_server");
         unsafe {
             let handle =
                 kernel32::CreateFileA(self.pipe_name.as_ptr(),
@@ -662,7 +705,8 @@ impl OsIpcSender {
                 return Err(WinError::last("CreateFileA"));
             }
 
-            self.handle = handle;
+            *self.handle.borrow_mut() = Arc::new(WinHandle::new(handle));
+            println!("< connect_to_server success (handle {:?})", handle);
         }
 
         Ok(())
@@ -671,22 +715,18 @@ impl OsIpcSender {
     pub fn send(&self,
                 in_data: &[u8],
                 ports: Vec<OsIpcChannel>,
-                shared_memory_regions: Vec<OsIpcSharedMemory>)
+                Shared_memory_regions: Vec<OsIpcSharedMemory>)
                 -> Result<(),WinError> {
-        println!(">send");
-        assert!(self.handle != INVALID_HANDLE_VALUE);
-
-        let handle = self.handle as intptr_t;
         // XXX we have to make a copy of the data here because we're going
         // to use a thread to do the write.  This isn't ideal.
         let data = in_data.to_vec();
+        let wh = self.handle.borrow().clone();
 
         thread::spawn(move || {
             unsafe {
                 let channel_handles: Vec<OsIpcChannelHandle> = vec![];
                 let shmem_sizes: Vec<u64> = vec![];
                 let shmem_handles: Vec<intptr_t> = vec![];
-                let mut ok: i32 = 0;
 
                 let mut header: Vec<usize> = vec![0; 2];
                 let mut oob_data: Vec<u8> = vec![];
@@ -731,17 +771,16 @@ impl OsIpcSender {
                     Ok(())
                 }
 
-                unsafe {
-                    let header_bytes = slice::from_raw_parts(header.as_ptr() as *const u8, 16);
-                    if write_buf(handle as HANDLE, &header_bytes).is_err() {
-                        return;
-                    }
-                    if write_buf(handle as HANDLE, &data).is_err() {
-                        return;
-                    }
-                    if write_buf(handle as HANDLE, &oob_data).is_err() {
-                        return;
-                    }
+                let handle = wh.as_win();
+                let header_bytes = slice::from_raw_parts(header.as_ptr() as *const u8, 16);
+                if write_buf(handle, &header_bytes).is_err() {
+                    return;
+                }
+                if write_buf(handle, &data).is_err() {
+                    return;
+                }
+                if write_buf(handle, &oob_data).is_err() {
+                    return;
                 }
             }
         });
@@ -928,11 +967,9 @@ impl OsIpcOneShotServer {
                                     Vec<u8>,
                                     Vec<OsOpaqueIpcChannel>,
                                     Vec<OsIpcSharedMemory>),WinError> {
-        unsafe {
-            let mut receiver = self.receiver.borrow_mut().take().unwrap();
-            let (data, channels, shmems) = try!(receiver.recv());
-            Ok((receiver, data, channels, shmems))
-        }
+        let receiver = self.receiver.borrow_mut().take().unwrap();
+        let (data, channels, shmems) = try!(receiver.recv());
+        Ok((receiver, data, channels, shmems))
     }
 }
 
