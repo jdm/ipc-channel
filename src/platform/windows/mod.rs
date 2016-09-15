@@ -61,11 +61,11 @@ struct OsIpcChannelHandle {
     sender: bool,
 }
 
-// XXX these should not be vecs; we'll change
-// this around soon anyway
+// If we have any channel handles or shmem segments,
+// then we'll send an OsIpcOutOfBandMessage after
+// the data message.
 #[derive(Serialize, Deserialize, Debug)]
-struct OsIpcMessage {
-    data: Vec<u8>,
+struct OsIpcOutOfBandMessage {
     channel_handles: Vec<OsIpcChannelHandle>,
     shmem_source_pid: u32,
     shmem_sizes: Vec<u64>,
@@ -197,7 +197,7 @@ fn reset_overlapped(ov: &mut winapi::OVERLAPPED) {
 }
 
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Display)]
 enum ServerState {
     // the named pipe has been created, but it is not connected
     // or will not be connected to anything
@@ -404,6 +404,7 @@ impl OsIpcReceiver {
             return Ok(());
         }
 
+        println!("state in start_read: {:?}", self.state.get());
         assert!(self.state.get() == ServerState::Connected);
 
         unsafe {
@@ -413,7 +414,10 @@ impl OsIpcReceiver {
 
             // if the buffer is full, add more space
             if buf.capacity() == buf.len() {
-                let more = min(buf.capacity(), READ_BUFFER_MAX_GROWTH);
+                let more =
+                    if buf.capacity() == 0 { READ_BUFFER_SIZE }
+                    else if buf.capacity() < READ_BUFFER_MAX_GROWTH { buf.capacity() }
+                    else { READ_BUFFER_MAX_GROWTH };
                 buf.reserve(more);
             }
 
@@ -465,6 +469,7 @@ impl OsIpcReceiver {
                     winapi::ERROR_IO_INCOMPLETE =>
                         return Ok(false),
                     winapi::ERROR_BROKEN_PIPE => {
+                        println!("finish_read GetOverlappedResult -> BROKEN_PIPE!");
                         self.state.set(ServerState::Disconnected);
                         return Ok(false);
                     },
@@ -483,51 +488,77 @@ impl OsIpcReceiver {
         }
     }
 
-    fn do_read(&self, block: bool) -> Result<OsIpcSelectionResult,WinError> {
+    unsafe fn do_read(&self, block: bool) -> Result<OsIpcSelectionResult,WinError> {
         println!("do_read");
 
         if self.state.get() == ServerState::Disconnected {
             return Ok(OsIpcSelectionResult::ChannelClosed(self.handle as i64));
         }
 
-        // read until we can't read no more
-        // Only the first read should block; subsequent ones should
-        // be nonblocking
+        // read until we get the expected number of bytes
         let mut do_block = block;
-        loop {
-            try!(self.start_read());
+        let mut read_header: bool = false;
+        let HEADER_SIZE: usize = 8*2;
+        let mut bytes_to_read: usize = HEADER_SIZE; // this is the minimum number of bytes we need to read
 
-            if try!(self.finish_read(do_block)) {
-                do_block = false;
-                continue;
+        let mut data_bytes: usize = 0;
+        let mut oob_bytes: usize = 0;
+
+        while self.read_buf.borrow().len() < bytes_to_read {
+            try!(self.start_read());
+            if try!(self.finish_read(do_block)) == false {
+                // If we're doing a nonblocking read and we didn't read anything, we're done;
+                // if we started reading a message, then do blocking reads until we finish.
+                if self.read_buf.borrow().len() == 0 {
+                    assert!(!block);
+                    return Ok(OsIpcSelectionResult::DataReceived(self.handle as i64, vec![], vec![], vec![]));
+                }
+
+                do_block = true;
             }
 
-            if self.read_buf.borrow().len() > 0 {
-                break;
+            // if we're just reading the header for the first time
+            if !read_header && self.read_buf.borrow().len() >= HEADER_SIZE {
+                let buf = self.read_buf.borrow();
+                let np = slice::from_raw_parts(buf.as_ptr() as *const usize, 2);
+                data_bytes = np[0];
+                oob_bytes = np[1];
+
+                bytes_to_read = HEADER_SIZE + data_bytes + oob_bytes;
+                read_header = true;
             }
         }
 
         // Sweet, we got a buffer
-
         let mut buf = self.read_buf.borrow_mut();
+        assert!(buf.len() == HEADER_SIZE + data_bytes + oob_bytes);
 
-        // deserialize
-        let mut msg: OsIpcMessage = match bincode::serde::deserialize(&buf) {
-            Ok(m) => m,
-            Err(err) => return Err(WinError(0xffffffffu32))
-        };
+        let buf_header = slice::from_raw_parts(buf.as_ptr().offset(0) as *const usize, 2);
+        let buf_data = slice::from_raw_parts(buf.as_ptr().offset(HEADER_SIZE as isize), data_bytes);
+        let buf_oob = slice::from_raw_parts(buf.as_ptr().offset((HEADER_SIZE + data_bytes) as isize), oob_bytes);
 
         let mut channels: Vec<OsOpaqueIpcChannel> = vec![];
         let mut shmems: Vec<OsIpcSharedMemory> = vec![];
         
-        // play with handles!
-        for ch_handle in &mut msg.channel_handles {
-            channels.push(OsOpaqueIpcChannel::from_opaque(ch_handle));
+        if oob_bytes > 0 {
+            // deserialize
+            let mut msg: OsIpcOutOfBandMessage = match bincode::serde::deserialize(&buf_oob) {
+                Ok(m) => m,
+                Err(err) => return Err(WinError(0xffffffffu32))
+            };
+
+            // play with handles!
+            for ch_handle in &mut msg.channel_handles {
+                channels.push(OsOpaqueIpcChannel::from_opaque(ch_handle));
+            }
+
+            // XXX fix shmems
         }
 
-        // XXX fix shmems
+        // truncate the read buffer back to 0
+        buf.truncate(0);
 
-        Ok(OsIpcSelectionResult::DataReceived(self.handle as i64, msg.data, channels, shmems))
+        Ok(OsIpcSelectionResult::DataReceived(self.handle as i64, buf_data.to_vec(), channels, shmems))
     }
 
     pub fn consume(&self) -> OsIpcReceiver {
@@ -543,9 +574,11 @@ impl OsIpcReceiver {
             return Err(WinError::last("blocking accept returned false?"));
         }
 
-        match try!(self.do_read(true)) {
-            OsIpcSelectionResult::DataReceived(_, a, b, c) => Ok((a, b, c)),
-            OsIpcSelectionResult::ChannelClosed(_) => Err(WinError::last("Channel closed?")),
+        unsafe {
+            match try!(self.do_read(true)) {
+                OsIpcSelectionResult::DataReceived(_, a, b, c) => Ok((a, b, c)),
+                OsIpcSelectionResult::ChannelClosed(_) => Err(WinError::last("Channel closed?")),
+            }
         }
     }
 
@@ -556,9 +589,11 @@ impl OsIpcReceiver {
             return Ok((vec![], vec![], vec![]));
         }
 
-        match try!(self.do_read(false)) {
-            OsIpcSelectionResult::DataReceived(_, a, b, c) => Ok((a, b, c)),
-            OsIpcSelectionResult::ChannelClosed(_) => Err(WinError::last("Channel closed?")),
+        unsafe {
+            match try!(self.do_read(false)) {
+                OsIpcSelectionResult::DataReceived(_, a, b, c) => Ok((a, b, c)),
+                OsIpcSelectionResult::ChannelClosed(_) => Err(WinError::last("Channel closed?")),
+            }
         }
     }
 }
@@ -652,40 +687,61 @@ impl OsIpcSender {
                 let shmem_sizes: Vec<u64> = vec![];
                 let shmem_handles: Vec<intptr_t> = vec![];
                 let mut ok: i32 = 0;
-    
-                let msg = OsIpcMessage {
-                    data: data,
-                    channel_handles: channel_handles,
-                    shmem_source_pid: kernel32::GetCurrentProcessId(),
-                    shmem_sizes: shmem_sizes,
-                    shmem_handles: shmem_handles
-                };
-    
-                let bytes = bincode::serde::serialize(&msg, bincode::SizeLimit::Infinite).unwrap();
-    
-                // 64k is the max size that is guaranteed to be able to be sent in a single transaction
-                // ... but we're not using CallNamedPipe
-                //assert!(bytes.len() < (64 * 1024));
-    
-                let mut nwritten: u32 = 0;
-                let mut ntowrite: u32 = bytes.len() as u32;
-                let bytesptr = bytes.as_ptr() as *mut c_void;
-                while nwritten < ntowrite {
-                    let mut nwrote: u32 = 0;
-                    if kernel32::WriteFile(handle as HANDLE,
-                                           bytesptr.offset(nwritten as isize),
-                                           ntowrite,
-                                           &mut nwrote,
-                                           ptr::null_mut())
-                        == winapi::FALSE
-                    {
-                        // this will println!
-                        WinError::last("WriteFile");
+
+                let mut header: Vec<usize> = vec![0; 2];
+                let mut oob_data: Vec<u8> = vec![];
+
+                if channel_handles.len() > 0 || shmem_handles.len() > 0 {
+                    let msg = OsIpcOutOfBandMessage {
+                        channel_handles: channel_handles,
+                        shmem_source_pid: kernel32::GetCurrentProcessId(),
+                        shmem_sizes: shmem_sizes,
+                        shmem_handles: shmem_handles,
+                    };
+
+                    oob_data = bincode::serde::serialize(&msg, bincode::SizeLimit::Infinite).unwrap();
+                }
+
+                header[0] = data.len();
+                header[1] = oob_data.len();
+
+                unsafe fn write_buf(handle: HANDLE, bytes: &[u8]) -> Result<(),WinError> {
+                    let mut ntowrite: u32 = bytes.len() as u32;
+                    if ntowrite == 0 {
+                        return Ok(());
+                    }
+                    let mut nwritten: u32 = 0;
+                    let bytesptr = bytes.as_ptr() as *mut c_void;
+                    while nwritten < ntowrite {
+                        let mut nwrote: u32 = 0;
+                        if kernel32::WriteFile(handle,
+                                               bytesptr.offset(nwritten as isize),
+                                               ntowrite,
+                                               &mut nwrote,
+                                               ptr::null_mut())
+                            == winapi::FALSE
+                        {
+                            // this will println!
+                            return Err(WinError::last("WriteFile"));
+                        }
+                        nwritten += nwrote;
+                        ntowrite -= nwrote;
+                        println!("Just wrote {} bytes, left {}/{} err {}", nwrote, nwritten, bytes.len(), GetLastError());
+                    }
+                    Ok(())
+                }
+
+                unsafe {
+                    let header_bytes = slice::from_raw_parts(header.as_ptr() as *const u8, 16);
+                    if write_buf(handle as HANDLE, &header_bytes).is_err() {
                         return;
                     }
-                    nwritten += nwrote;
-                    ntowrite -= nwrote;
-                    println!("Just wrote {} bytes, left {}/{} err {}", nwrote, nwritten, bytes.len(), GetLastError());
+                    if write_buf(handle as HANDLE, &data).is_err() {
+                        return;
+                    }
+                    if write_buf(handle as HANDLE, &oob_data).is_err() {
+                        return;
+                    }
                 }
             }
         });
